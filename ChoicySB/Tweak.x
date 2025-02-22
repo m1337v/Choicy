@@ -77,7 +77,7 @@ BOOL choicy_shouldDisableTweakInjectionForApplication(NSString *applicationID)
 
 NSDictionary *choicy_applyEnvironmentChanges(NSDictionary *originalEnvironment, NSString *bundleIdentifier)
 {
-	if (originalEnvironment[@"_MSSafeMode"] || originalEnvironment[@"_SafeMode"]) {
+	if (originalEnvironment[@"_MSSafeMode"] || originalEnvironment[@"_SafeMode"] || originalEnvironment[@"_CHOICY_LOAD_TWEAKS_ONCE"]) {
 		// If this is set, it was set by the SpringBoard hook and that should act as an override
 		// To support the haptic touch app option
 		return originalEnvironment;

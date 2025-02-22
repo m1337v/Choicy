@@ -105,7 +105,7 @@
 			[_specifiers addObject:daemonToggleSpecifier];
 
 			PSSpecifier *daemonsGroup = [PSSpecifier emptyGroupSpecifier];
-			[daemonsGroup setProperty:localize(@"DAEMON_LIST_BOTTOM_NOTICE") forKey:@"footerText"];
+			// [daemonsGroup setProperty:localize(@"DAEMON_LIST_BOTTOM_NOTICE") forKey:@"footerText"];
 			[_specifiers addObject:daemonsGroup];
 
 			NSArray<CHPDaemonInfo*> *daemonList = [CHPDaemonList sharedInstance].daemonList;

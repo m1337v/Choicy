@@ -31,131 +31,132 @@
 
 - (id)_editButtonBarItem
 {
-	UIBarButtonItem *addButton = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemAdd target:self action:@selector(addButtonPressed)];
-	return addButton;
+    UIBarButtonItem *addButton = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemAdd target:self action:@selector(addButtonPressed)];
+    return addButton;
 }
 
 - (id)previewStringForSpecifier:(PSSpecifier *)specifier
 {
-	return [CHPListController previewStringForSpecifier:specifier];
+    return [CHPListController previewStringForSpecifier:specifier];
 }
 
 - (void)loadAdditionalExecutables
 {
-	NSArray *additionalExecutables = preferences[kChoicyPrefsKeyAdditionalExecutables];
-	if (additionalExecutables) {
-		_additionalExecutables = additionalExecutables.mutableCopy;
-	}
-	else {
-		_additionalExecutables = [NSMutableArray new];
-	}
+    NSArray *additionalExecutables = preferences[kChoicyPrefsKeyAdditionalExecutables];
+    if (additionalExecutables) {
+        _additionalExecutables = additionalExecutables.mutableCopy;
+    }
+    else {
+        _additionalExecutables = [NSMutableArray new];
+    }
 }
 
 - (void)saveAdditionalExecutables
 {
-	NSMutableDictionary *mutablePrefs = preferencesForWriting();
-	mutablePrefs[kChoicyPrefsKeyAdditionalExecutables] = _additionalExecutables.copy;
-	writePreferences(mutablePrefs);
+    NSMutableDictionary *mutablePrefs = preferencesForWriting();
+    mutablePrefs[kChoicyPrefsKeyAdditionalExecutables] = _additionalExecutables.copy;
+    writePreferences(mutablePrefs);
 }
 
 - (void)addButtonPressed
 {
-	UIAlertController *executableAlert = [UIAlertController alertControllerWithTitle:localize(@"SELECT_EXECUTABLE") message:localize(@"SELECT_EXECUTABLE_MESSAGE") preferredStyle:UIAlertControllerStyleAlert];
+    UIAlertController *executableAlert = [UIAlertController alertControllerWithTitle:localize(@"SELECT_EXECUTABLE") message:localize(@"SELECT_EXECUTABLE_MESSAGE") preferredStyle:UIAlertControllerStyleAlert];
 
-	[executableAlert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
-		textField.placeholder = localize(@"PATH");
-		if (@available(iOS 13, *)) {
-			textField.textColor = [UIColor labelColor];
-		}
-		else {
-			textField.textColor = [UIColor blackColor];
-		}
-		textField.keyboardType = UIKeyboardTypeDefault;
-		textField.clearButtonMode = UITextFieldViewModeWhileEditing;
-		textField.borderStyle = UITextBorderStyleNone;
-	}];
+    [executableAlert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
+        textField.placeholder = localize(@"PATH");
+        if (@available(iOS 13, *)) {
+            textField.textColor = [UIColor labelColor];
+        }
+        else {
+            textField.textColor = [UIColor blackColor];
+        }
+        textField.keyboardType = UIKeyboardTypeDefault;
+        textField.clearButtonMode = UITextFieldViewModeWhileEditing;
+        textField.borderStyle = UITextBorderStyleNone;
+    }];
 
-	UIAlertAction *cancelAction = [UIAlertAction actionWithTitle:localize(@"CANCEL") style:UIAlertActionStyleCancel handler:nil];
-	[executableAlert addAction:cancelAction];
+    UIAlertAction *cancelAction = [UIAlertAction actionWithTitle:localize(@"CANCEL") style:UIAlertActionStyleCancel handler:nil];
+    [executableAlert addAction:cancelAction];
 
-	UIAlertAction *addAction = [UIAlertAction actionWithTitle:localize(@"ADD") style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-		UITextField *pathField = executableAlert.textFields[0];
-		[self addExecutableAtPath:pathField.text];
-	}];
-	[executableAlert addAction:addAction];
+    UIAlertAction *addAction = [UIAlertAction actionWithTitle:localize(@"ADD") style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        UITextField *pathField = executableAlert.textFields[0];
+        [self addExecutableAtPath:pathField.text];
+    }];
+    [executableAlert addAction:addAction];
 
-	[self presentViewController:executableAlert animated:YES completion:nil];
+    [self presentViewController:executableAlert animated:YES completion:nil];
 }
 
 - (void)showErrorMessage:(NSString *)message
 {
-	UIAlertController *errorAlert = [UIAlertController alertControllerWithTitle:localize(@"ERROR") message:message preferredStyle:UIAlertControllerStyleAlert];
-	UIAlertAction *closeAction = [UIAlertAction actionWithTitle:localize(@"CLOSE") style:UIAlertActionStyleDefault handler:nil];
-	[errorAlert addAction:closeAction];
+    UIAlertController *errorAlert = [UIAlertController alertControllerWithTitle:localize(@"ERROR") message:message preferredStyle:UIAlertControllerStyleAlert];
+    UIAlertAction *closeAction = [UIAlertAction actionWithTitle:localize(@"CLOSE") style:UIAlertActionStyleDefault handler:nil];
+    [errorAlert addAction:closeAction];
 
-	[self presentViewController:errorAlert animated:YES completion:nil];
+    [self presentViewController:errorAlert animated:YES completion:nil];
 }
 
 - (void)addExecutableAtPath:(NSString *)executablePath
 {
-	if ([_additionalExecutables containsObject:executablePath]) return;
+    if ([_additionalExecutables containsObject:executablePath]) return;
 
-	if (![[NSFileManager defaultManager] fileExistsAtPath:executablePath]) {
-		[self showErrorMessage:localize(@"ERROR_FILE_NOT_FOUND")];
-		return;
-	}
+    if (![[NSFileManager defaultManager] fileExistsAtPath:jbroot(executablePath)]) {
+        [self showErrorMessage:localize(@"ERROR_FILE_NOT_FOUND")];
+        return;
+    }
 
-	if ([CHPMachoParser isMachoAtPath:executablePath]) {
-		[self showErrorMessage:localize(@"ERROR_FILE_NO_EXECUTABLE")];
-		return;
-	}
+    if ([CHPMachoParser isMachoAtPath:jbroot(executablePath)]) {
+        [self showErrorMessage:localize(@"ERROR_FILE_NO_EXECUTABLE")];
+        return;
+    }
 
-	if (![[CHPTweakList sharedInstance] oneOrMoreTweaksInjectIntoExecutableAtPath:executablePath]) {
-		[self showErrorMessage:localize(@"ERROR_NO_TWEAKS_INJECT")];
-		return;
-	}
+    if (![[CHPTweakList sharedInstance] oneOrMoreTweaksInjectIntoExecutableAtPath:jbroot(executablePath)]) {
+        [self showErrorMessage:localize(@"ERROR_NO_TWEAKS_INJECT")];
+        return;
+    }
 
-	[_additionalExecutables addObject:executablePath];
-	[self saveAdditionalExecutables];
+    [_additionalExecutables addObject:executablePath];
+    [self saveAdditionalExecutables];
 
-	PSSpecifier *specifierToInsert = [CHPListController createSpecifierForExecutable:executablePath named:executablePath];
-	[self insertSpecifier:specifierToInsert atEndOfGroup:0 animated:YES];
+    PSSpecifier *specifierToInsert = [CHPListController createSpecifierForExecutable:jbroot(executablePath) named:executablePath];
+    [self insertSpecifier:specifierToInsert atEndOfGroup:0 animated:YES];
 }
 
 - (UITableViewCellEditingStyle)tableView:(UITableView *)tableView editingStyleForRowAtIndexPath:(NSIndexPath *)indexPath
 {
-	return UITableViewCellEditingStyleDelete;
+    return UITableViewCellEditingStyleDelete;
 }
 
 - (BOOL)performDeletionActionForSpecifier:(PSSpecifier *)specifier
 {
-	BOOL orig = [super performDeletionActionForSpecifier:specifier];
+    BOOL orig = [super performDeletionActionForSpecifier:specifier];
 
-	NSString *executablePath = [specifier propertyForKey:@"executablePath"];
-	[_additionalExecutables removeObject:executablePath];
-	[self saveAdditionalExecutables];
+    NSString *executablePath = [specifier propertyForKey:@"executablePath"];
+    [_additionalExecutables removeObject:executablePath];
+    [self saveAdditionalExecutables];
 
-	return orig;
+    return orig;
 }
 
 - (NSMutableArray *)specifiers
 {
-	if (!_specifiers) {
-		_specifiers = [NSMutableArray new];
+    if (!_specifiers) {
+        _specifiers = [NSMutableArray new];
 
-		[self loadAdditionalExecutables];
+        [self loadAdditionalExecutables];
 
-		PSSpecifier *groupSpecifier = [PSSpecifier emptyGroupSpecifier];
-		[groupSpecifier setProperty:localize(@"ADDITIONAL_EXECUTABLES_FOOTER") forKey:@"footerText"];
+        PSSpecifier *groupSpecifier = [PSSpecifier emptyGroupSpecifier];
+        [groupSpecifier setProperty:localize(@"ADDITIONAL_EXECUTABLES_FOOTER") forKey:@"footerText"];
 
-		[_specifiers addObject:groupSpecifier];
+        [_specifiers addObject:groupSpecifier];
 
-		[_additionalExecutables enumerateObjectsUsingBlock:^(NSString *executablePath, NSUInteger idx, BOOL *stop) {
-			[_specifiers addObject:[CHPListController createSpecifierForExecutable:executablePath named:executablePath]];
-		}];
-	}
+        [_additionalExecutables enumerateObjectsUsingBlock:^(NSString *executablePath, NSUInteger idx, BOOL *stop) {
+            NSString *jbPath = jbroot(executablePath);
+            [_specifiers addObject:[CHPListController createSpecifierForExecutable:jbPath named:executablePath]];
+        }];
+    }
 
-	return _specifiers;
+    return _specifiers;
 }
 
 @end

@@ -23,7 +23,7 @@
 #import "SpringBoard.h"
 #import "ChoicyOverrideManager.h"
 #import <UIKit/UIKit.h>
-#import <libroot.h>
+#import <roothide.h>
 #import "ChoicySB.h"
 
 NSBundle *CHBundle;
@@ -58,9 +58,18 @@ BOOL choicy_shouldShow3DTouchOptionForDisableTweakInjectionState(BOOL disableTwe
 	toggleOneTimeApplicationID = nil;
 	if (toggleOnce) {
 		NSMutableDictionary *environmentM = [executionContext.environment mutableCopy];
-		BOOL newValue = !choicy_shouldDisableTweakInjectionForApplication(bundleIdentifier);
-		[environmentM setObject:@(newValue) forKey:@"_MSSafeMode"];
-		[environmentM setObject:@(newValue) forKey:@"_SafeMode"];
+		if(choicy_shouldDisableTweakInjectionForApplication(bundleIdentifier)) {
+			//tweak disabled in preferences, so we want to enable them for this time launch
+			[environmentM setObject:@(1) forKey:@"_CHOICY_LOAD_TWEAKS_ONCE"];
+			[environmentM removeObjectForKey:@"_MSSafeMode"];
+			[environmentM removeObjectForKey:@"_SafeMode"];
+		}
+		else {
+			//tweak not disabled in preferences, so we want to disable them for this time launch
+			[environmentM setObject:@(1) forKey:@"_MSSafeMode"];
+			[environmentM setObject:@(1) forKey:@"_SafeMode"];
+			[environmentM removeObjectForKey:@"_CHOICY_LOAD_TWEAKS_ONCE"];
+		}
 		executionContext.environment = [environmentM copy];
 	}
 	
@@ -242,7 +251,7 @@ void choicy_initSpringBoard(void)
 {
 	%init();
 
-	CHBundle = [NSBundle bundleWithPath:JBROOT_PATH_NSSTRING(@"/Library/Application Support/Choicy.bundle")];
+	CHBundle = [NSBundle bundleWithPath:jbroot(@"/Library/Application Support/Choicy.bundle")];
 	CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, respring, CFSTR("com.opa334.choicy/respring"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
 
 	if (kCFCoreFoundationVersionNumber >= kCFCoreFoundationVersionNumber_iOS_13_0) {
