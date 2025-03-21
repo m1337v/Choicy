@@ -142,11 +142,11 @@ static bool should_hide_from_app(const char *path)
 
 	return strstr(path, "jbroot") ||
 			strstr(path, "dopamine") || // dopamine compatibility
-			strstr(path, "procursus"); // dopamine compatibility
+			strstr(path, "procursus") || // dopamine compatibility
+			strstr(path, "/systemhook");
 			// strstr(path, "/libroot.dylib") ||
 	       	// strstr(path, "/roothideinit.dylib") ||
 	       	// strstr(path, "/roothidepatch.dylib") ||
-	       	// strstr(path, "/systemhook") ||
 	       	// strstr(path, "/Choicy.dylib");
 }
 
