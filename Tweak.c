@@ -27,7 +27,6 @@
 #include <os/log.h>
 #include <dlfcn.h>
 #include <libroot.h>
-#include <mach-o/dyld.h>
 #include <mach-o/getsect.h>
 #include <ptrauth.h>
 #include <litehook.h>
@@ -35,6 +34,9 @@
 #include "nextstep_plist.h"
 #include <roothide.h>
 #include <stdbool.h>
+#include "fishhook.h"
+#include <stdio.h>
+#include <string.h>
 
 bool should_load_dylib(const char *dylibPath);
 
@@ -96,6 +98,149 @@ bool gTweakInjectionDisabled = false;
 xpc_object_t gAllowedTweaks = NULL;
 xpc_object_t gDeniedTweaks = NULL;
 xpc_object_t gGlobalDeniedTweaks = NULL;
+
+// ** START HIDING LOGIC **
+
+// Pointers to the original functions
+uint32_t (*dyld_image_count_orig)(void) = NULL;
+const char *(*dyld_get_image_name_orig)(uint32_t) = NULL;
+const struct mach_header *(*dyld_get_image_header_orig)(uint32_t);
+intptr_t (*dyld_get_image_vmaddr_slide_orig)(uint32_t);
+char *(*getenv_orig)(const char *);
+
+// Example predicate: decide if a path is "hidden"
+static bool should_hide_from_app(const char *path)
+{
+    if (!path) return false;
+
+	// Old Roothide logic -> hardcoded paths
+    // 1. Only hide tweaks we care about
+    // bool is_roothide_tweak =
+    //     strstr(path, "systemhook-") ||
+    //     strstr(path, "roothideinit.dylib") ||
+    //     strstr(path, "roothidepatch.dylib") ||
+    //     strstr(path, "libroothide.dylib") ||
+    //     strstr(path, "Choicy.dylib") ||
+	// 	// Dopamine compatibility
+	// 	strstr(path, "systemhook") ||
+	// 	strstr(path, "libroot.dylib");
+
+	// if (!is_roothide_tweak) return false;
+
+	// // 2. Only hide from processes where tweak injection is managed by Choicy
+    // if (gTweakInjectionDisabled || gAllowedTweaks || gDeniedTweaks) {
+    //     return true;
+    // }
+
+	// New logic: Everything in jbroot if Choicy has a rule
+	if (!(gTweakInjectionDisabled || gAllowedTweaks || gDeniedTweaks)) {
+		return false;
+	}
+	
+	// const char *jbPrefix = jbroot("/");
+	// size_t jbPrefixLen = strlen(jbPrefix);
+
+	return strstr(path, "jbroot") ||
+			strstr(path, "dopamine") || // dopamine compatibility
+			strstr(path, "procursus"); // dopamine compatibility
+			// strstr(path, "/libroot.dylib") ||
+	       	// strstr(path, "/roothideinit.dylib") ||
+	       	// strstr(path, "/roothidepatch.dylib") ||
+	       	// strstr(path, "/systemhook") ||
+	       	// strstr(path, "/Choicy.dylib");
+}
+
+// Hook for dyld_image_count()
+uint32_t dyld_image_count_hook(void)
+{
+    uint32_t realCount = dyld_image_count_orig();
+    uint32_t visibleCount = 0;
+
+    for (uint32_t i = 0; i < realCount; i++) {
+        const char *path = dyld_get_image_name_orig(i);
+        if (!path) continue;
+
+        // Only count visible images
+        if (!should_hide_from_app(path)) {
+            visibleCount++;
+        }
+    }
+
+    return visibleCount;
+}
+
+// Hook for dyld_get_image_name()
+const char *dyld_get_image_name_hook(uint32_t idx)
+{
+    uint32_t realCount = dyld_image_count_orig();
+    uint32_t visibleSoFar = 0;
+
+    for (uint32_t i = 0; i < realCount; i++) {
+        const char *path = dyld_get_image_name_orig(i);
+        if (!path || should_hide_from_app(path)) continue;
+
+        if (visibleSoFar == idx) {
+            return path;
+        }
+
+        visibleSoFar++;
+    }
+
+    return NULL;
+}
+
+// Hook for dyld_get_image_header()
+const struct mach_header *dyld_get_image_header_hook(uint32_t idx)
+{
+    uint32_t realCount = dyld_image_count_orig();
+    uint32_t visibleSoFar = 0;
+
+    for (uint32_t i = 0; i < realCount; i++) {
+        const char *path = dyld_get_image_name_orig(i);
+        if (!path || should_hide_from_app(path)) continue;
+
+        if (visibleSoFar == idx) {
+            return dyld_get_image_header_orig(i);
+        }
+        visibleSoFar++;
+    }
+
+    return NULL;
+}
+
+intptr_t dyld_get_image_vmaddr_slide_hook(uint32_t idx)
+{
+    uint32_t realCount = dyld_image_count_orig();
+    uint32_t visibleSoFar = 0;
+
+    for (uint32_t i = 0; i < realCount; i++) {
+        const char *path = dyld_get_image_name_orig(i);
+        if (!path || should_hide_from_app(path)) continue;
+
+        if (visibleSoFar == idx) {
+            return dyld_get_image_vmaddr_slide_orig(i);
+        }
+        visibleSoFar++;
+    }
+
+    return 0;
+}
+
+char *getenv_hook(const char *name)
+{
+    if (name && strcmp(name, "DYLD_INSERT_LIBRARIES") == 0)
+    {
+        // Only spoof if this process is being filtered by Choicy
+        if (gTweakInjectionDisabled || gAllowedTweaks || gDeniedTweaks)
+        {
+            os_log_dbg("Hiding DYLD_INSERT_LIBRARIES from getenv()");
+            return NULL;
+        }
+    }
+
+    return getenv_orig(name);
+}
+// *** END HIDING LOGIC ***
 
 bool string_has_prefix(const char *str, const char* prefix)
 {
@@ -475,6 +620,12 @@ const struct mach_header *find_tweak_loader_mach_header(const char **pathOut)
 		jbroot("/usr/lib/substrate/SubstrateLoader.dylib"),									 // Substrate
 		jbroot("/Library/Frameworks/CydiaSubstrate.framework/Libraries/SubstrateLoader.dylib"), // Substrate (Older versions)
 		jbroot("/usr/lib/Sonar/libsonar.dylib"),												 // Sonar
+		// Roothide (not hiding)
+		// jbroot("/usr/lib/systemhook-65263F0451BEF562.dylib"),
+		// jbroot("/usr/lib/roothideinit.dylib"),
+		// jbroot("/usr/lib/roothidepatch.dylib"),
+		// jbroot("/usr/lib/libroothide.dylib"),
+		// jbroot("/usr/lib/TweakInject/  Choicy.dylib")
 	};
 
 	bool foundTweakLoader = false;
@@ -489,14 +640,14 @@ const struct mach_header *find_tweak_loader_mach_header(const char **pathOut)
 
 	if (!foundTweakLoader) return NULL;
 
-	for (int i = 0; i < _dyld_image_count(); i++) {
-		const char *path = _dyld_get_image_name(i);
+	for (int i = 0; i < dyld_image_count_orig(); i++) {
+		const char *path = dyld_get_image_name_orig(i);
 		struct stat pathStat;
 		if (stat(path, &pathStat) == 0) {
 			if (pathStat.st_dev == tweakLoaderStat.st_dev && pathStat.st_ino == tweakLoaderStat.st_ino) {
 				os_log_dbg("Found tweak loader: %{public}s\n", path);
 				if (pathOut) *pathOut = path;
-				return _dyld_get_image_header(i);
+				return dyld_get_image_header_orig(i);
 			}
 		}
 	}
@@ -543,6 +694,19 @@ int replace_bss_pointer(const struct mach_header *mh, void *pointerToReplace, vo
 
 	return c;
 }
+
+static void install_dyld_hooks(void)
+{
+    struct rebinding dyld_rebindings[] = {
+        { "_dyld_image_count", (void *)dyld_image_count_hook, (void **)&dyld_image_count_orig },
+        { "_dyld_get_image_name", (void *)dyld_get_image_name_hook, (void **)&dyld_get_image_name_orig },
+        { "_dyld_get_image_header", (void *)dyld_get_image_header_hook, (void **)&dyld_get_image_header_orig },
+        { "_dyld_get_image_vmaddr_slide", (void *)dyld_get_image_vmaddr_slide_hook, (void **)&dyld_get_image_vmaddr_slide_orig },
+        { "getenv", (void *)getenv_hook, (void **)&getenv_orig },
+    };
+    rebind_symbols(dyld_rebindings, sizeof(dyld_rebindings) / sizeof(dyld_rebindings[0]));
+}
+
 
 __attribute__((constructor)) static void initializer(void)
 {
@@ -611,4 +775,5 @@ __attribute__((constructor)) static void initializer(void)
 			}
 		}
 	}
+	install_dyld_hooks();
 }

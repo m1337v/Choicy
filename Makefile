@@ -18,7 +18,7 @@ include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = Choicy
 
-Choicy_FILES = Tweak.c nextstep_plist.c $(wildcard external/litehook/src/*.c)
+Choicy_FILES = Tweak.c fishhook.c nextstep_plist.c $(wildcard external/litehook/src/*.c)
 Choicy_CFLAGS = -DTHEOS_LEAN_AND_MEAN -I./external/litehook/src -I./external/litehook/external/include
 
 include $(THEOS_MAKE_PATH)/tweak.mk
