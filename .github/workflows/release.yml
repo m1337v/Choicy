@@ -1,0 +1,108 @@
+name: Build And Release
+
+on:
+  push:
+    branches:
+      - roothide-dev
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: choicy-roothide-release
+  cancel-in-progress: true
+
+jobs:
+  build-and-release:
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Install Procursus
+        uses: dhinakg/procursus-action@main
+        with:
+          packages: ldid findutils sed coreutils make dpkg
+
+      - name: Setup Theos
+        run: |
+          git clone --recursive https://github.com/roothide/theos "$GITHUB_WORKSPACE/theos"
+          echo "THEOS=$GITHUB_WORKSPACE/theos" >> "$GITHUB_ENV"
+          echo "$GITHUB_WORKSPACE/theos/bin" >> "$GITHUB_PATH"
+
+      - name: Install XPC Headers
+        run: |
+          git clone --depth 1 https://github.com/realthunder/mac-headers
+          mkdir -p "$THEOS/include"
+          cp -R mac-headers/usr/include/xpc "$THEOS/include/"
+
+      - name: Install iPhoneOS16.5 SDK
+        run: |
+          mkdir -p "$THEOS/sdks"
+          curl -L https://github.com/theos/sdks/releases/latest/download/iPhoneOS16.5.sdk.tar.xz \
+            --output "$THEOS/sdks/iPhoneOS16.5.sdk.tar.xz"
+          tar -xJf "$THEOS/sdks/iPhoneOS16.5.sdk.tar.xz" -C "$THEOS/sdks"
+          rm "$THEOS/sdks/iPhoneOS16.5.sdk.tar.xz"
+
+      - name: Install AltList
+        run: |
+          mkdir -p vendor
+          git clone --depth 1 https://github.com/roothide/AltList vendor/AltList
+          cd vendor/AltList
+          chmod +x install_to_theos.sh
+          ./install_to_theos.sh
+
+      - name: Build Roothide Package
+        run: |
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide
+
+      - name: Prepare Release Assets
+        run: |
+          shopt -s nullglob
+          debs=(packages/*.deb)
+          if [ "${#debs[@]}" -eq 0 ]; then
+            echo "No deb package was produced"
+            exit 1
+          fi
+          mkdir -p build
+          cp "${debs[0]}" build/Choicy-roothide.deb
+          shasum -a 256 build/Choicy-roothide.deb > build/Choicy-roothide.deb.sha256
+          ls -l build
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: choicy-roothide
+          path: |
+            ${{ github.workspace }}/build/Choicy-roothide.deb
+            ${{ github.workspace }}/build/Choicy-roothide.deb.sha256
+
+      - name: Move roothide Tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f roothide "$GITHUB_SHA"
+          git push origin refs/tags/roothide --force
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: roothide
+          name: roothide
+          target_commitish: ${{ github.sha }}
+          draft: false
+          prerelease: true
+          overwrite_files: true
+          body: |
+            Automated roothide build for `${{ github.ref_name }}`.
+
+            Commit: `${{ github.sha }}`
+            Workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          files: |
+            ${{ github.workspace }}/build/Choicy-roothide.deb
+            ${{ github.workspace }}/build/Choicy-roothide.deb.sha256
