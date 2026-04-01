@@ -1,11 +1,3 @@
-# Add Roothide-specific configurations
-ifeq ($(THEOS_PACKAGE_SCHEME),roothide)
-Choicy_CFLAGS += -I$(THEOS)/vendor/include/roothide -DROOTHIDE_COMPAT=1
-Choicy_LDFLAGS += -L$(THEOS)/vendor/lib/roothide -lroothide
-Choicy_FILES += $(wildcard roothide/*.c)
-endif
-
-# Keep existing target configuration
 ifeq ($(THEOS_PACKAGE_SCHEME),rootless)
 TARGET = iphone:clang:16.5:15.0
 else ifeq ($(THEOS_PACKAGE_SCHEME),roothide)
@@ -18,7 +10,7 @@ include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = Choicy
 
-Choicy_FILES = Tweak.c fishhook.c nextstep_plist.c $(wildcard external/litehook/src/*.c)
+Choicy_FILES = Tweak.c Tweak.s fishhook.c nextstep_plist.c $(wildcard external/litehook/src/*.c)
 Choicy_CFLAGS = -DTHEOS_LEAN_AND_MEAN -I./external/litehook/src -I./external/litehook/external/include
 
 include $(THEOS_MAKE_PATH)/tweak.mk

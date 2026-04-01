@@ -41,8 +41,12 @@
 
 + (NSArray *)possibleInjectionLibrariesPaths
 {
+	if (![jbroot(@"/") isEqualToString:@"/"]) {
+		return @[jbroot([@"/" stringByAppendingString:@"Library/MobileSubstrate/DynamicLibraries"]), jbroot([@"/" stringByAppendingString:@"usr/lib/TweakInject"])];
+	}
+
 	// /Library and /usr always gets converted to rootless paths on xina, so this workaround is neccessary
-	return @[jbroot(@"/Library/MobileSubstrate/DynamicLibraries"), jbroot(@"/usr/lib/TweakInject"), @"/var/jb/Library/MobileSubstrate/DynamicLibraries", @"/var/jb/usr/lib/TweakInject"];
+	return @[[@"/" stringByAppendingString:@"Library/MobileSubstrate/DynamicLibraries"], [@"/" stringByAppendingString:@"usr/lib/TweakInject"], @"/var/jb/Library/MobileSubstrate/DynamicLibraries", @"/var/jb/usr/lib/TweakInject"];
 }
 
 + (NSString *)injectionLibrariesPath
@@ -61,8 +65,7 @@
 	if (![path.pathExtension isEqualToString:@"dylib"]) return NO;
 
 	for (NSString *possibleInjectionLibrariesPath in [self possibleInjectionLibrariesPaths]) {
-		//if ([path hasPrefix:possibleInjectionLibrariesPath]) return YES;
-		if([possibleInjectionLibrariesPath hasSuffix:[path stringByDeletingLastPathComponent]]) return YES;
+		if ([path hasPrefix:possibleInjectionLibrariesPath]) return YES;
 	}
 
 	return NO;
@@ -102,7 +105,6 @@
 	self.tweakList = [tweakListM copy];
 }
 
-/*
 - (NSArray *)tweakListForExecutableAtPath:(NSString *)executablePath
 {
 	HBLogDebugWeak(@"tweakListForExecutableAtPath:%@", executablePath);
@@ -116,22 +118,6 @@
 	[self.tweakList enumerateObjectsUsingBlock:^(CHPTweakInfo *tweakInfo, NSUInteger idx, BOOL *stop) {
 		if (bundleID) {
 			if ([tweakInfo.filterBundles containsObject:bundleID]) {
-				[tweakListForExecutable addObject:tweakInfo];
-				return;
-			}
-		}
-
-		if([executablePath isEqualToString:@"/System/Library/CoreServices/SpringBoard.app/SpringBoard"]) {
-			__block BOOL isUITweak = NO;
-
-			[tweakInfo.filterBundles enumerateObjectsUsingBlock:^(NSString *bundleID, NSUInteger idx, BOOL *stop) {
-				if ([bundleID hasPrefix:@"com.apple.UIKit"] || [bundleID hasPrefix:@"com.apple.TextInput"] || [bundleID hasPrefix:@"com.apple.TextEntry"]) {
-					isUITweak = YES;
-					*stop = YES;
-				}
-			}];
-
-			if(isUITweak) {
 				[tweakListForExecutable addObject:tweakInfo];
 				return;
 			}
@@ -151,33 +137,6 @@
 					*stop = YES;
 				}
 			}];
-		}
-	}];
-
-	return tweakListForExecutable;
-}
-//*/
-
-- (NSArray *)tweakListForExecutableAtPath:(NSString *)executablePath
-{
-	HBLogDebugWeak(@"tweakListForExecutableAtPath:%@", executablePath);
-	if (!executablePath) return nil;
-
-	NSString *executableName = executablePath.lastPathComponent;
-
-	NSMutableArray *tweakListForExecutable = [NSMutableArray new];
-	[self.tweakList enumerateObjectsUsingBlock:^(CHPTweakInfo *tweakInfo, NSUInteger idx, BOOL *stop) {
-
-		if (executableName) {
-			if ([tweakInfo.filterExecutables containsObject:executableName]) {
-				[tweakListForExecutable addObject:tweakInfo];
-				return;
-			}
-		}
-
-		if (tweakInfo.filterBundles) {
-			[tweakListForExecutable addObject:tweakInfo];
-			return;
 		}
 	}];
 

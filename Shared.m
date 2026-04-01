@@ -19,7 +19,7 @@
 // SOFTWARE.
 
 #import "Shared.h"
-#import <roothide.h>
+#import "roothide.h"
 
 BOOL parseNumberBool(id number, BOOL default_)
 {

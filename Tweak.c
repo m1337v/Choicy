@@ -21,51 +21,33 @@
 #include <mach/mach.h>
 #include <stdlib.h>
 #include <mach-o/dyld.h>
+#include <mach-o/dyld_images.h>
+#include <mach/task_info.h>
+#include <sys/syscall.h>
 #include <sys/stat.h>
 #include <xpc/xpc.h>
 #include <libgen.h>
 #include <os/log.h>
+#include <os/lock.h>
 #include <dlfcn.h>
-#include <libroot.h>
+#include <roothide.h>
+#include <mach-o/dyld.h>
 #include <mach-o/getsect.h>
 #include <ptrauth.h>
 #include <litehook.h>
 #include "dyld_interpose.h"
 #include "nextstep_plist.h"
-#include <roothide.h>
-#include <stdbool.h>
 #include "fishhook.h"
-#include <stdio.h>
-#include <string.h>
-
-bool should_load_dylib(const char *dylibPath);
 
 void *(*dlopen_orig)(const char*, int);
-// merged from gen.c
-void *dlopen_hook(const char *path, int mode)
-{
-    if (path) {
-        if (!should_load_dylib(path)) {
-            return NULL;
-        }
-    }
-    __attribute__((musttail)) return dlopen_orig(path, mode);
-}
+void *dlopen_hook(const char *path, int mode);
 
 void *(*dyld_dlopen_orig)(const void *, const char*, int);
-// merged from gen.c
-void *dyld_dlopen_hook(const void *dyld, const char *path, int mode)
-{
-    if (path) {
-        if (!should_load_dylib(path)) {
-            return NULL;
-        }
-    }
-    __attribute__((musttail)) return dyld_dlopen_orig(dyld, path, mode);
-}
+void *dyld_dlopen_hook(const void *dyld, const char *path, int mode);
 
-bool gShouldLog = true;
+bool gShouldLog = false;
 #define os_log_dbg(args ...) if (gShouldLog) os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_DEBUG, args)
+#define os_log_err(args ...) if (gShouldLog) os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_ERROR, args)
 
 extern xpc_object_t xpc_create_from_plist(const void *buf, size_t len);
 #define kEnvDeniedTweaksOverride "CHOICY_DENIED_TWEAKS_OVERRIDE"
@@ -98,149 +80,6 @@ bool gTweakInjectionDisabled = false;
 xpc_object_t gAllowedTweaks = NULL;
 xpc_object_t gDeniedTweaks = NULL;
 xpc_object_t gGlobalDeniedTweaks = NULL;
-
-// ** START HIDING LOGIC **
-
-// Pointers to the original functions
-uint32_t (*dyld_image_count_orig)(void) = NULL;
-const char *(*dyld_get_image_name_orig)(uint32_t) = NULL;
-const struct mach_header *(*dyld_get_image_header_orig)(uint32_t);
-intptr_t (*dyld_get_image_vmaddr_slide_orig)(uint32_t);
-char *(*getenv_orig)(const char *);
-
-// Example predicate: decide if a path is "hidden"
-static bool should_hide_from_app(const char *path)
-{
-    if (!path) return false;
-
-	// Old Roothide logic -> hardcoded paths
-    // 1. Only hide tweaks we care about
-    // bool is_roothide_tweak =
-    //     strstr(path, "systemhook-") ||
-    //     strstr(path, "roothideinit.dylib") ||
-    //     strstr(path, "roothidepatch.dylib") ||
-    //     strstr(path, "libroothide.dylib") ||
-    //     strstr(path, "Choicy.dylib") ||
-	// 	// Dopamine compatibility
-	// 	strstr(path, "systemhook") ||
-	// 	strstr(path, "libroot.dylib");
-
-	// if (!is_roothide_tweak) return false;
-
-	// // 2. Only hide from processes where tweak injection is managed by Choicy
-    // if (gTweakInjectionDisabled || gAllowedTweaks || gDeniedTweaks) {
-    //     return true;
-    // }
-
-	// New logic: Everything in jbroot if Choicy has a rule
-	if (!(gTweakInjectionDisabled || gAllowedTweaks || gDeniedTweaks)) {
-		return false;
-	}
-	
-	// const char *jbPrefix = jbroot("/");
-	// size_t jbPrefixLen = strlen(jbPrefix);
-
-	return strstr(path, "jbroot") ||
-			strstr(path, "dopamine") || // dopamine compatibility
-			strstr(path, "procursus") || // dopamine compatibility
-			strstr(path, "/systemhook");
-			// strstr(path, "/libroot.dylib") ||
-	       	// strstr(path, "/roothideinit.dylib") ||
-	       	// strstr(path, "/roothidepatch.dylib") ||
-	       	// strstr(path, "/Choicy.dylib");
-}
-
-// Hook for dyld_image_count()
-uint32_t dyld_image_count_hook(void)
-{
-    uint32_t realCount = dyld_image_count_orig();
-    uint32_t visibleCount = 0;
-
-    for (uint32_t i = 0; i < realCount; i++) {
-        const char *path = dyld_get_image_name_orig(i);
-        if (!path) continue;
-
-        // Only count visible images
-        if (!should_hide_from_app(path)) {
-            visibleCount++;
-        }
-    }
-
-    return visibleCount;
-}
-
-// Hook for dyld_get_image_name()
-const char *dyld_get_image_name_hook(uint32_t idx)
-{
-    uint32_t realCount = dyld_image_count_orig();
-    uint32_t visibleSoFar = 0;
-
-    for (uint32_t i = 0; i < realCount; i++) {
-        const char *path = dyld_get_image_name_orig(i);
-        if (!path || should_hide_from_app(path)) continue;
-
-        if (visibleSoFar == idx) {
-            return path;
-        }
-
-        visibleSoFar++;
-    }
-
-    return NULL;
-}
-
-// Hook for dyld_get_image_header()
-const struct mach_header *dyld_get_image_header_hook(uint32_t idx)
-{
-    uint32_t realCount = dyld_image_count_orig();
-    uint32_t visibleSoFar = 0;
-
-    for (uint32_t i = 0; i < realCount; i++) {
-        const char *path = dyld_get_image_name_orig(i);
-        if (!path || should_hide_from_app(path)) continue;
-
-        if (visibleSoFar == idx) {
-            return dyld_get_image_header_orig(i);
-        }
-        visibleSoFar++;
-    }
-
-    return NULL;
-}
-
-intptr_t dyld_get_image_vmaddr_slide_hook(uint32_t idx)
-{
-    uint32_t realCount = dyld_image_count_orig();
-    uint32_t visibleSoFar = 0;
-
-    for (uint32_t i = 0; i < realCount; i++) {
-        const char *path = dyld_get_image_name_orig(i);
-        if (!path || should_hide_from_app(path)) continue;
-
-        if (visibleSoFar == idx) {
-            return dyld_get_image_vmaddr_slide_orig(i);
-        }
-        visibleSoFar++;
-    }
-
-    return 0;
-}
-
-char *getenv_hook(const char *name)
-{
-    if (name && strcmp(name, "DYLD_INSERT_LIBRARIES") == 0)
-    {
-        // Only spoof if this process is being filtered by Choicy
-        if (gTweakInjectionDisabled || gAllowedTweaks || gDeniedTweaks)
-        {
-            os_log_dbg("Hiding DYLD_INSERT_LIBRARIES from getenv()");
-            return NULL;
-        }
-    }
-
-    return getenv_orig(name);
-}
-// *** END HIDING LOGIC ***
 
 bool string_has_prefix(const char *str, const char* prefix)
 {
@@ -286,6 +125,506 @@ char *path_copy_dirname(const char *path)
 	char pathdup[strlen(path) + 1];
 	strcpy(pathdup, path);
 	return strdup(dirname(pathdup));
+}
+
+static uint32_t (*dyld_image_count_orig)(void) = NULL;
+static const char *(*dyld_get_image_name_orig)(uint32_t) = NULL;
+static const struct mach_header *(*dyld_get_image_header_orig)(uint32_t) = NULL;
+static intptr_t (*dyld_get_image_vmaddr_slide_orig)(uint32_t) = NULL;
+static char *(*getenv_orig)(const char *) = NULL;
+static int (*dladdr_orig)(const void *, Dl_info *) = NULL;
+static kern_return_t (*task_info_orig)(task_name_t, task_flavor_t, task_info_t, mach_msg_type_number_t *) = NULL;
+static __thread int gStealthBypassCheckDepth = 0;
+static struct dyld_all_image_infos *gSanitizedAllImageInfos = NULL;
+static struct dyld_image_info *gSanitizedImageInfoArray = NULL;
+static uint32_t gSanitizedImageInfoCapacity = 0;
+static struct dyld_uuid_info *gSanitizedUuidInfoArray = NULL;
+static uint32_t gSanitizedUuidInfoCapacity = 0;
+static os_unfair_lock gTaskInfoSanitizeLock = OS_UNFAIR_LOCK_INIT;
+
+int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
+int csops_audittoken(pid_t pid, unsigned int ops, void *useraddr, size_t usersize, audit_token_t *token);
+
+#define CS_VALID 0x00000001
+#define CS_HARD 0x00000100
+#define CS_KILL 0x00000200
+#define CS_DEBUGGED 0x10000000
+#define CS_OPS_STATUS 0
+
+static bool should_enable_stealth_hiding(void)
+{
+	return gTweakInjectionDisabled || gAllowedTweaks;
+}
+
+static bool path_is_in_hidden_tweak_directory(const char *path)
+{
+	if (!path) return false;
+
+	const char *hiddenPrefixes[] = {
+		jbroot("/Library/MobileSubstrate/DynamicLibraries/"),
+		jbroot("/usr/lib/TweakInject/"),
+		"/var/jb/Library/MobileSubstrate/DynamicLibraries/",
+		"/var/jb/usr/lib/TweakInject/",
+	};
+
+	for (uint32_t i = 0; i < sizeof(hiddenPrefixes) / sizeof(*hiddenPrefixes); i++) {
+		const char *prefix = hiddenPrefixes[i];
+		if (prefix && string_has_prefix(path, prefix)) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static bool path_is_hidden_loader(const char *path)
+{
+	if (!path) return false;
+
+	const char *basename = strrchr(path, '/');
+	basename = basename ? &basename[1] : path;
+
+	const char *hiddenNames[] = {
+		"   Choicy.dylib",
+		"Choicy.dylib",
+		"TweakLoader.dylib",
+		"substitute-loader.dylib",
+		"TweakInject.dylib",
+		"SubstrateLoader.dylib",
+		"libsonar.dylib",
+		"roothideinit.dylib",
+		"roothidepatch.dylib",
+		"libroothide.dylib",
+		"libroot.dylib",
+	};
+
+	for (uint32_t i = 0; i < sizeof(hiddenNames) / sizeof(*hiddenNames); i++) {
+		if (!strcmp(basename, hiddenNames[i])) {
+			return true;
+		}
+	}
+
+	return string_has_prefix(basename, "systemhook-") && string_has_suffix(basename, ".dylib");
+}
+
+static bool should_hide_from_app(const char *path)
+{
+	if (!should_enable_stealth_hiding()) {
+		return false;
+	}
+
+	return path_is_in_hidden_tweak_directory(path) || path_is_hidden_loader(path);
+}
+
+static bool should_hide_env_name(const char *name)
+{
+	if (!name || !should_enable_stealth_hiding()) {
+		return false;
+	}
+
+	return !strcmp(name, "DYLD_INSERT_LIBRARIES")
+		|| !strcmp(name, "_MSSafeMode")
+		|| !strcmp(name, "_SafeMode")
+		|| !strcmp(name, "_SubstituteSafeMode")
+		|| !strcmp(name, "_ChoicyInjectionEnabledFromSpringBoard");
+}
+
+static int resolve_dladdr(const void *addr, Dl_info *info)
+{
+	if (dladdr_orig) {
+		return dladdr_orig(addr, info);
+	}
+	return dladdr(addr, info);
+}
+
+static const char *path_for_mach_header_in_infos(const struct dyld_all_image_infos *infos, const struct mach_header *header)
+{
+	if (!header) {
+		return NULL;
+	}
+
+	if (infos && infos->infoArray) {
+		for (uint32_t i = 0; i < infos->infoArrayCount; i++) {
+			const struct dyld_image_info *entry = &infos->infoArray[i];
+			if (entry->imageLoadAddress == header) {
+				return entry->imageFilePath;
+			}
+		}
+	}
+
+	Dl_info info = {0};
+	if (resolve_dladdr(header, &info) == 0) {
+		return NULL;
+	}
+	return info.dli_fname;
+}
+
+static bool should_hide_mach_header_from_app(const struct dyld_all_image_infos *infos, const struct mach_header *header)
+{
+	const char *path = path_for_mach_header_in_infos(infos, header);
+	return should_hide_from_app(path);
+}
+
+static bool caller_should_bypass_hiding(const void *returnAddress)
+{
+	if (!should_enable_stealth_hiding()) {
+		return false;
+	}
+
+	if (gStealthBypassCheckDepth > 0) {
+		return true;
+	}
+
+	if (!returnAddress) {
+		return false;
+	}
+
+	Dl_info callerInfo = {0};
+	gStealthBypassCheckDepth++;
+	int dladdrResult = resolve_dladdr(returnAddress, &callerInfo);
+	gStealthBypassCheckDepth--;
+	if (dladdrResult == 0 || !callerInfo.dli_fname) {
+		return false;
+	}
+
+	return path_is_hidden_loader(callerInfo.dli_fname) || path_is_in_hidden_tweak_directory(callerInfo.dli_fname);
+}
+
+static uint32_t dyld_image_count_hook(void)
+{
+	if (!dyld_image_count_orig || !dyld_get_image_name_orig) {
+		return 0;
+	}
+
+	if (caller_should_bypass_hiding(__builtin_extract_return_addr(__builtin_return_address(0)))) {
+		return dyld_image_count_orig();
+	}
+
+	uint32_t realCount = dyld_image_count_orig();
+	uint32_t visibleCount = 0;
+
+	for (uint32_t i = 0; i < realCount; i++) {
+		const char *path = dyld_get_image_name_orig(i);
+		if (!path || should_hide_from_app(path)) {
+			continue;
+		}
+
+		visibleCount++;
+	}
+
+	return visibleCount;
+}
+
+static const char *dyld_get_image_name_hook(uint32_t idx)
+{
+	if (!dyld_image_count_orig || !dyld_get_image_name_orig) {
+		return NULL;
+	}
+
+	if (caller_should_bypass_hiding(__builtin_extract_return_addr(__builtin_return_address(0)))) {
+		return dyld_get_image_name_orig(idx);
+	}
+
+	uint32_t realCount = dyld_image_count_orig();
+	uint32_t visibleSoFar = 0;
+
+	for (uint32_t i = 0; i < realCount; i++) {
+		const char *path = dyld_get_image_name_orig(i);
+		if (!path || should_hide_from_app(path)) {
+			continue;
+		}
+
+		if (visibleSoFar == idx) {
+			return path;
+		}
+
+		visibleSoFar++;
+	}
+
+	return NULL;
+}
+
+static const struct mach_header *dyld_get_image_header_hook(uint32_t idx)
+{
+	if (!dyld_image_count_orig || !dyld_get_image_name_orig || !dyld_get_image_header_orig) {
+		return NULL;
+	}
+
+	if (caller_should_bypass_hiding(__builtin_extract_return_addr(__builtin_return_address(0)))) {
+		return dyld_get_image_header_orig(idx);
+	}
+
+	uint32_t realCount = dyld_image_count_orig();
+	uint32_t visibleSoFar = 0;
+
+	for (uint32_t i = 0; i < realCount; i++) {
+		const char *path = dyld_get_image_name_orig(i);
+		if (!path || should_hide_from_app(path)) {
+			continue;
+		}
+
+		if (visibleSoFar == idx) {
+			return dyld_get_image_header_orig(i);
+		}
+
+		visibleSoFar++;
+	}
+
+	return NULL;
+}
+
+static intptr_t dyld_get_image_vmaddr_slide_hook(uint32_t idx)
+{
+	if (!dyld_image_count_orig || !dyld_get_image_name_orig || !dyld_get_image_vmaddr_slide_orig) {
+		return 0;
+	}
+
+	if (caller_should_bypass_hiding(__builtin_extract_return_addr(__builtin_return_address(0)))) {
+		return dyld_get_image_vmaddr_slide_orig(idx);
+	}
+
+	uint32_t realCount = dyld_image_count_orig();
+	uint32_t visibleSoFar = 0;
+
+	for (uint32_t i = 0; i < realCount; i++) {
+		const char *path = dyld_get_image_name_orig(i);
+		if (!path || should_hide_from_app(path)) {
+			continue;
+		}
+
+		if (visibleSoFar == idx) {
+			return dyld_get_image_vmaddr_slide_orig(i);
+		}
+
+		visibleSoFar++;
+	}
+
+	return 0;
+}
+
+static char *getenv_hook(const char *name)
+{
+	if (!name) {
+		return NULL;
+	}
+
+	if (getenv_orig && caller_should_bypass_hiding(__builtin_extract_return_addr(__builtin_return_address(0)))) {
+		return getenv_orig(name);
+	}
+
+	if (should_hide_env_name(name)) {
+		os_log_dbg("Hiding %{public}s from getenv()", name);
+		return NULL;
+	}
+
+	return getenv_orig ? getenv_orig(name) : NULL;
+}
+
+static int dladdr_hook(const void *addr, Dl_info *info)
+{
+	if (caller_should_bypass_hiding(__builtin_extract_return_addr(__builtin_return_address(0)))) {
+		return resolve_dladdr(addr, info);
+	}
+
+	int result = resolve_dladdr(addr, info);
+	if (!result || !info || !info->dli_fname || !should_hide_from_app(info->dli_fname)) {
+		return result;
+	}
+
+	info->dli_fname = gExecutablePath;
+	info->dli_fbase = (void *)_dyld_get_image_header(0);
+	info->dli_sname = NULL;
+	info->dli_saddr = NULL;
+	return 1;
+}
+
+static void sanitize_task_dyld_info_in_place(task_info_t taskInfoOut, mach_msg_type_number_t taskInfoOutCnt)
+{
+	if (!taskInfoOut || taskInfoOutCnt < TASK_DYLD_INFO_COUNT) {
+		return;
+	}
+
+	task_dyld_info_data_t *dyldInfo = (task_dyld_info_data_t *)taskInfoOut;
+	if (dyldInfo->all_image_info_addr == 0) {
+		return;
+	}
+
+	struct dyld_all_image_infos *realInfos = (struct dyld_all_image_infos *)(uintptr_t)dyldInfo->all_image_info_addr;
+	if (!realInfos || !realInfos->infoArray || realInfos->infoArrayCount == 0) {
+		return;
+	}
+
+	os_unfair_lock_lock(&gTaskInfoSanitizeLock);
+
+	if (!gSanitizedAllImageInfos) {
+		gSanitizedAllImageInfos = calloc(1, sizeof(*gSanitizedAllImageInfos));
+		if (!gSanitizedAllImageInfos) {
+			os_unfair_lock_unlock(&gTaskInfoSanitizeLock);
+			return;
+		}
+	}
+
+	if (realInfos->infoArrayCount > gSanitizedImageInfoCapacity) {
+		struct dyld_image_info *newInfoArray = realloc(gSanitizedImageInfoArray, sizeof(*gSanitizedImageInfoArray) * realInfos->infoArrayCount);
+		if (!newInfoArray) {
+			os_unfair_lock_unlock(&gTaskInfoSanitizeLock);
+			return;
+		}
+		gSanitizedImageInfoArray = newInfoArray;
+		gSanitizedImageInfoCapacity = realInfos->infoArrayCount;
+	}
+
+	uint32_t visibleInfoCount = 0;
+	for (uint32_t i = 0; i < realInfos->infoArrayCount; i++) {
+		const struct dyld_image_info *entry = &realInfos->infoArray[i];
+		if (should_hide_from_app(entry->imageFilePath)) {
+			continue;
+		}
+		gSanitizedImageInfoArray[visibleInfoCount++] = *entry;
+	}
+
+	uint32_t visibleUuidCount = 0;
+	bool hasUuidArray = realInfos->version >= 8 && realInfos->uuidArray && realInfos->uuidArrayCount > 0;
+	if (hasUuidArray) {
+		if (realInfos->uuidArrayCount > gSanitizedUuidInfoCapacity) {
+			struct dyld_uuid_info *newUuidArray = realloc(gSanitizedUuidInfoArray, sizeof(*gSanitizedUuidInfoArray) * realInfos->uuidArrayCount);
+			if (!newUuidArray) {
+				os_unfair_lock_unlock(&gTaskInfoSanitizeLock);
+				return;
+			}
+			gSanitizedUuidInfoArray = newUuidArray;
+			gSanitizedUuidInfoCapacity = (uint32_t)realInfos->uuidArrayCount;
+		}
+
+		for (uintptr_t i = 0; i < realInfos->uuidArrayCount; i++) {
+			const struct dyld_uuid_info *entry = &realInfos->uuidArray[i];
+			if (should_hide_mach_header_from_app(realInfos, entry->imageLoadAddress)) {
+				continue;
+			}
+			gSanitizedUuidInfoArray[visibleUuidCount++] = *entry;
+		}
+	}
+
+	*gSanitizedAllImageInfos = *realInfos;
+	gSanitizedAllImageInfos->infoArray = gSanitizedImageInfoArray;
+	gSanitizedAllImageInfos->infoArrayCount = visibleInfoCount;
+	if (realInfos->version >= 8) {
+		gSanitizedAllImageInfos->uuidArray = hasUuidArray ? gSanitizedUuidInfoArray : NULL;
+		gSanitizedAllImageInfos->uuidArrayCount = visibleUuidCount;
+	}
+	if (realInfos->version >= 9) {
+		gSanitizedAllImageInfos->dyldAllImageInfosAddress = gSanitizedAllImageInfos;
+	}
+
+	dyldInfo->all_image_info_addr = (mach_vm_address_t)(uintptr_t)gSanitizedAllImageInfos;
+	dyldInfo->all_image_info_size = (mach_vm_size_t)sizeof(*gSanitizedAllImageInfos);
+
+	os_unfair_lock_unlock(&gTaskInfoSanitizeLock);
+}
+
+static kern_return_t task_info_hook(task_name_t targetTask, task_flavor_t flavor, task_info_t taskInfoOut, mach_msg_type_number_t *taskInfoOutCnt)
+{
+	if (!task_info_orig) {
+		return KERN_FAILURE;
+	}
+
+	if (caller_should_bypass_hiding(__builtin_extract_return_addr(__builtin_return_address(0)))) {
+		return task_info_orig(targetTask, flavor, taskInfoOut, taskInfoOutCnt);
+	}
+
+	kern_return_t kr = task_info_orig(targetTask, flavor, taskInfoOut, taskInfoOutCnt);
+	if (kr != KERN_SUCCESS || flavor != TASK_DYLD_INFO || targetTask != mach_task_self()) {
+		return kr;
+	}
+
+	sanitize_task_dyld_info_in_place(taskInfoOut, taskInfoOutCnt ? *taskInfoOutCnt : 0);
+	return kr;
+}
+
+static void apply_stealth_csops_flags(unsigned int ops, pid_t pid, void *useraddr, size_t usersize, const void *returnAddress)
+{
+	if (ops != CS_OPS_STATUS || pid != getpid() || usersize < sizeof(uint32_t) || !useraddr) {
+		return;
+	}
+
+	if (!should_enable_stealth_hiding()) {
+		return;
+	}
+
+	if (caller_should_bypass_hiding(returnAddress)) {
+		return;
+	}
+
+	uint32_t *flags = (uint32_t *)useraddr;
+
+	// Mirror the hardened view detectors expect without touching the kernel-side state.
+	*flags |= (CS_VALID | CS_HARD | CS_KILL);
+	*flags &= ~CS_DEBUGGED;
+}
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+static int csops_hook(pid_t pid, unsigned int ops, void *useraddr, size_t usersize)
+{
+	int rv = syscall(SYS_csops, pid, ops, useraddr, usersize);
+	if (rv == 0) {
+		apply_stealth_csops_flags(ops, pid, useraddr, usersize, __builtin_extract_return_addr(__builtin_return_address(0)));
+	}
+	return rv;
+}
+
+static int csops_audittoken_hook(pid_t pid, unsigned int ops, void *useraddr, size_t usersize, audit_token_t *token)
+{
+	int rv = syscall(SYS_csops_audittoken, pid, ops, useraddr, usersize, token);
+	if (rv == 0) {
+		apply_stealth_csops_flags(ops, pid, useraddr, usersize, __builtin_extract_return_addr(__builtin_return_address(0)));
+	}
+	return rv;
+}
+#pragma clang diagnostic pop
+
+static void install_stealth_hiding_hooks(void)
+{
+	struct rebinding dyldRebindings[] = {
+		{ "_dyld_image_count", (void *)dyld_image_count_hook, (void **)&dyld_image_count_orig },
+		{ "_dyld_get_image_name", (void *)dyld_get_image_name_hook, (void **)&dyld_get_image_name_orig },
+		{ "_dyld_get_image_header", (void *)dyld_get_image_header_hook, (void **)&dyld_get_image_header_orig },
+		{ "_dyld_get_image_vmaddr_slide", (void *)dyld_get_image_vmaddr_slide_hook, (void **)&dyld_get_image_vmaddr_slide_orig },
+		{ "getenv", (void *)getenv_hook, (void **)&getenv_orig },
+		{ "dladdr", (void *)dladdr_hook, (void **)&dladdr_orig },
+		{ "task_info", (void *)task_info_hook, (void **)&task_info_orig },
+	};
+
+	int r = rebind_symbols(dyldRebindings, sizeof(dyldRebindings) / sizeof(*dyldRebindings));
+	if (r != 0) {
+		os_log_err("Failed to install stealth hiding hooks: %d", r);
+	}
+
+	if (litehook_hook_function((void *)csops, (void *)csops_hook) != KERN_SUCCESS) {
+		os_log_err("Failed to install csops stealth hook");
+	}
+
+	if (litehook_hook_function((void *)csops_audittoken, (void *)csops_audittoken_hook) != KERN_SUCCESS) {
+		os_log_err("Failed to install csops_audittoken stealth hook");
+	}
+}
+
+static void scrub_stealth_environment(void)
+{
+	if (!should_enable_stealth_hiding()) {
+		return;
+	}
+
+	const char *namesToUnset[] = {
+		"_MSSafeMode",
+		"_SafeMode",
+		"_SubstituteSafeMode",
+		"_ChoicyInjectionEnabledFromSpringBoard",
+	};
+
+	for (uint32_t i = 0; i < sizeof(namesToUnset) / sizeof(*namesToUnset); i++) {
+		unsetenv(namesToUnset[i]);
+	}
 }
 
 xpc_object_t xpc_object_from_plist(const char *path)
@@ -386,7 +725,15 @@ void load_global_preferences(xpc_object_t preferencesXdict, xpc_object_t process
 
 void load_process_preferences(xpc_object_t preferencesXdict, xpc_object_t processPreferencesXdict)
 {
-	if (gProcessType != PROCESS_TYPE_APP || !strcmp(gBundleIdentifier, kSpringboardBundleID)) {
+	// There are two possible cases how we can get here with kChoicyProcessPrefsKeyTweakInjectionDisabled=true in the plist
+	// (Since normally that option will also prevent this dylib from injecting, meaning our code would not execute in the first place)
+	// 1) The process is not an app spawned by SpringBoard (Since we can only set _SafeMode variables from SpringBoard/runningboardd)
+	// 2) The process was launched via the "Launch with Tweaks" haptic touch option on SpringBoard
+	// We can differentiate between the two, because 2) will also set the "_ChoicyInjectionEnabledFromSpringBoard" env variable
+	if (getenv("_ChoicyInjectionEnabledFromSpringBoard")) {
+		gTweakInjectionDisabled = false;
+	}
+	else {
 		gTweakInjectionDisabled = xpc_dictionary_get_bool(processPreferencesXdict, kChoicyProcessPrefsKeyTweakInjectionDisabled);
 	}
 
@@ -430,6 +777,8 @@ void load_process_info(void)
 	else if (string_has_suffix(executableDir, ".appex")) gProcessType = PROCESS_TYPE_PLUGIN;
 	else												 gProcessType = PROCESS_TYPE_BINARY;
 
+	os_log_dbg("Identified process type: %d\n", gProcessType);
+
 	// Load application identifier
 	size_t infoPlistPathSize = strlen(executableDir) + strlen("/Info.plist") + 1;
 	char infoPlistPath[infoPlistPathSize];
@@ -442,6 +791,7 @@ void load_process_info(void)
 			const char *bundleIdentifier = xpc_dictionary_get_string(infoXdict, "CFBundleIdentifier");
 			if (bundleIdentifier) {
 				gBundleIdentifier = strdup(bundleIdentifier);
+				os_log_dbg("Identified bundle identifier: %{PUBLIC}s", gBundleIdentifier);
 			}
 			xpc_release(infoXdict);
 		}
@@ -450,6 +800,17 @@ void load_process_info(void)
 	// Load overwrites from environment
 	parse_allow_deny_list(getenv(kEnvDeniedTweaksOverride), &gDeniedTweaks);
 	parse_allow_deny_list(getenv(kEnvAllowedTweaksOverride), &gAllowedTweaks);
+
+	if (gDeniedTweaks && gShouldLog && os_log_debug_enabled(OS_LOG_DEFAULT)) {
+		char *gDeniedTweaksDesc = xpc_copy_description(gDeniedTweaks);
+		os_log_dbg("Loaded denied tweaks from environment: %{PUBLIC}s", gDeniedTweaksDesc ?: "<none>");
+		if (gDeniedTweaksDesc) free(gDeniedTweaksDesc);
+	}
+	if (gAllowedTweaks && gShouldLog && os_log_debug_enabled(OS_LOG_DEFAULT)) {
+		char *gAllowedTweaksDesc = xpc_copy_description(gAllowedTweaks);
+		os_log_dbg("Loaded allowed tweaks from environment: %{PUBLIC}s", gAllowedTweaksDesc ?: "<none>");
+		if (gAllowedTweaksDesc) free(gAllowedTweaksDesc);
+	}
 
 	// Load preferences
 	xpc_object_t preferencesXdict = xpc_object_from_plist(kChoicyPrefsPlistPath);
@@ -479,15 +840,40 @@ void load_process_info(void)
 				}
 			}
 
+			if (processPreferencesXdict && gShouldLog && os_log_debug_enabled(OS_LOG_DEFAULT)) {
+				char *processPreferencesXdictDesc = xpc_copy_description(processPreferencesXdict);
+				os_log_dbg("Loaded process preferences: %{PUBLIC}s", processPreferencesXdictDesc ?: "<none>");
+				if (processPreferencesXdictDesc) free(processPreferencesXdictDesc);
+			}
+
 			// Load global preferences
 			load_global_preferences(preferencesXdict, processPreferencesXdict);
+			if (gGlobalDeniedTweaks && gShouldLog && os_log_debug_enabled(OS_LOG_DEFAULT)) {
+				char *gGlobalDeniedTweaksDesc = xpc_copy_description(gGlobalDeniedTweaks);
+				os_log_dbg("Loaded globally denied tweaks: %{PUBLIC}s", gGlobalDeniedTweaksDesc ?: "<none>");
+				if (gGlobalDeniedTweaksDesc) free(gGlobalDeniedTweaksDesc);
+			}
 
 			// If neither the allow nor the deny list has been overwritten from the environment, load them from preferences
 			if (!gDeniedTweaks && !gAllowedTweaks && processPreferencesXdict) {
 				load_process_preferences(preferencesXdict, processPreferencesXdict);
+
+				if (gDeniedTweaks && os_log_debug_enabled(OS_LOG_DEFAULT)) {
+					char *gDeniedTweaksDesc = xpc_copy_description(gDeniedTweaks);
+					os_log_dbg("Loaded denied tweaks from process preferences: %{PUBLIC}s", gDeniedTweaksDesc ?: "<none>");
+					if (gDeniedTweaksDesc) free(gDeniedTweaksDesc);
+				}
+				if (gAllowedTweaks && os_log_debug_enabled(OS_LOG_DEFAULT)) {
+					char *gAllowedTweaksDesc = xpc_copy_description(gAllowedTweaks);
+					os_log_dbg("Loaded allowed tweaks from process preferences: %{PUBLIC}s", gAllowedTweaksDesc ?: "<none>");
+					if (gAllowedTweaksDesc) free(gAllowedTweaksDesc);
+				}
 			}
 		}
 		xpc_release(preferencesXdict);
+	}
+	else if (gShouldLog) {
+		os_log_err("Choicy failed to load preferences");
 	}
 }
 
@@ -526,6 +912,10 @@ bool dylib_is_tweak(const char *dylibPath)
 
 bool should_load_dylib(const char *dylibPath)
 {
+	if(gTweakInjectionDisabled && string_has_suffix(dylibPath, "/usr/lib/ellekit/OldABI.dylib")) {
+		return false;
+	}
+
 	if (!string_has_suffix(dylibPath, ".dylib")) return true;
 
 	char *dylibNameHeap = path_copy_basename(dylibPath);
@@ -620,12 +1010,6 @@ const struct mach_header *find_tweak_loader_mach_header(const char **pathOut)
 		jbroot("/usr/lib/substrate/SubstrateLoader.dylib"),									 // Substrate
 		jbroot("/Library/Frameworks/CydiaSubstrate.framework/Libraries/SubstrateLoader.dylib"), // Substrate (Older versions)
 		jbroot("/usr/lib/Sonar/libsonar.dylib"),												 // Sonar
-		// Roothide (not hiding)
-		// jbroot("/usr/lib/systemhook-65263F0451BEF562.dylib"),
-		// jbroot("/usr/lib/roothideinit.dylib"),
-		// jbroot("/usr/lib/roothidepatch.dylib"),
-		// jbroot("/usr/lib/libroothide.dylib"),
-		// jbroot("/usr/lib/TweakInject/  Choicy.dylib")
 	};
 
 	bool foundTweakLoader = false;
@@ -640,14 +1024,14 @@ const struct mach_header *find_tweak_loader_mach_header(const char **pathOut)
 
 	if (!foundTweakLoader) return NULL;
 
-	for (int i = 0; i < dyld_image_count_orig(); i++) {
-		const char *path = dyld_get_image_name_orig(i);
+	for (int i = 0; i < _dyld_image_count(); i++) {
+		const char *path = _dyld_get_image_name(i);
 		struct stat pathStat;
 		if (stat(path, &pathStat) == 0) {
 			if (pathStat.st_dev == tweakLoaderStat.st_dev && pathStat.st_ino == tweakLoaderStat.st_ino) {
 				os_log_dbg("Found tweak loader: %{public}s\n", path);
 				if (pathOut) *pathOut = path;
-				return dyld_get_image_header_orig(i);
+				return _dyld_get_image_header(i);
 			}
 		}
 	}
@@ -664,6 +1048,12 @@ int dyld_hook_routine(void **dyld, int idx, void *hook, void **orig, uint16_t pa
 	if (!dyldFuncPtrs) return -1;
 
 	if (vm_protect(mach_task_self_, (mach_vm_address_t)&dyldFuncPtrs[idx], sizeof(void *), false, VM_PROT_READ | VM_PROT_WRITE) == 0) {
+	// on some devices vm_protect may fail due to (os/kern) protection failure in dsc::__DATA_CONST:__const when using in cache dyld
+	} else if (vm_protect(mach_task_self_, (mach_vm_address_t)&dyldFuncPtrs[idx], sizeof(void *), false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) == 0) {
+	} else {
+		abort();
+	}
+	{
 		uint64_t location = (uint64_t)&dyldFuncPtrs[idx];
 		__unused uint64_t pacDiversifier = (location & ~(0xFFFFull << 48)) | ((uint64_t)pacSalt << 48);
 
@@ -676,42 +1066,32 @@ int dyld_hook_routine(void **dyld, int idx, void *hook, void **orig, uint16_t pa
 	return -1;
 }
 
-int replace_bss_pointer(const struct mach_header *mh, void *pointerToReplace, void *replacementPointer)
+int replace_bss_pointers(const struct mach_header *mh, void *pointersToReplace[], void *replacementPointers[], uint32_t pointerCount)
 {
 	unsigned long bssSectionSize = 0;
 	uint8_t *bssSection = getsectiondata((void *)mh, "__DATA", "__bss", &bssSectionSize);
 	if (!bssSection) return 0;
 
-	int c = 0;
-	uint8_t *curPtr = bssSection;
-	while (true) {
-		void **found = memmem(curPtr, bssSectionSize - (curPtr - bssSection), &pointerToReplace, sizeof(pointerToReplace));
-		if (!found) break;
-		*found = replacementPointer;
-		c++;
-		curPtr = (uint8_t *)found + sizeof(pointerToReplace);
+	int replacementCount = 0;
+	void **bssPtrs = (void **)bssSection;
+	uint32_t bssPtrCount = (bssSectionSize / 8);
+	for (uint32_t i = 0; i < bssPtrCount; i++) {
+		void *curPtr = bssPtrs[i];
+		for (uint32_t k = 0; k < pointerCount; k++) {
+			if ((uintptr_t)curPtr == (uintptr_t)pointersToReplace[k]) {
+				bssPtrs[i] = replacementPointers[k];
+				replacementCount++;
+			}
+		}
 	}
-
-	return c;
+	return replacementCount;
 }
-
-static void install_dyld_hooks(void)
-{
-    struct rebinding dyld_rebindings[] = {
-        { "_dyld_image_count", (void *)dyld_image_count_hook, (void **)&dyld_image_count_orig },
-        { "_dyld_get_image_name", (void *)dyld_get_image_name_hook, (void **)&dyld_get_image_name_orig },
-        { "_dyld_get_image_header", (void *)dyld_get_image_header_hook, (void **)&dyld_get_image_header_orig },
-        { "_dyld_get_image_vmaddr_slide", (void *)dyld_get_image_vmaddr_slide_hook, (void **)&dyld_get_image_vmaddr_slide_orig },
-        { "getenv", (void *)getenv_hook, (void **)&getenv_orig },
-    };
-    rebind_symbols(dyld_rebindings, sizeof(dyld_rebindings) / sizeof(dyld_rebindings[0]));
-}
-
 
 __attribute__((constructor)) static void initializer(void)
 {
 	load_process_info();
-	os_log_dbg("Choicy works");
+	os_log_dbg("Choicy loaded");
+	scrub_stealth_environment();
 
 	if (gTweakInjectionDisabled || gAllowedTweaks || gDeniedTweaks || gGlobalDeniedTweaks) {
 		os_log_dbg("Initializing Choicy...");
@@ -739,16 +1119,26 @@ __attribute__((constructor)) static void initializer(void)
 			const char *tweakLoaderPath = NULL;
 			const struct mach_header *tweakLoaderHeader = find_tweak_loader_mach_header(&tweakLoaderPath);
 			if (tweakLoaderHeader) {
+				bool skipDynamicInterpose = false;
+
 				// On rootful / iOS <=14, there are multiple different special cases we need to take care of
 				// First: substitute-loader.dylib is heavily obfuscated and gets the dlopen pointer via dlsym before Choicy runs
 				// So in order to support substitute, we have to find the dlopen pointer in it's BSS section and replace it
 				if (!strcmp(tweakLoaderPath, "/usr/lib/substitute-loader.dylib")) {
-					__unused int c = replace_bss_pointer(tweakLoaderHeader, dlopen, dlopen_hook);
-					os_log_dbg("Replaced %u dlopen pointer(s) in bss section", c);
-					if (dlopen_from) {
-						c = replace_bss_pointer(tweakLoaderHeader, dlopen_from, dlopen_from_hook);
-						os_log_dbg("Replaced %u dlopen_from pointer(s) in bss section", c);
-					}
+					void *pointersToReplace[] = {
+						dlopen,
+						dlopen_from,
+					};
+
+					void *replacementPointers[] = {
+						dlopen_hook,
+						dlopen_from_hook,
+					};
+
+					uint32_t pointerCount = sizeof(pointersToReplace) / sizeof(*pointersToReplace);
+					if (!dlopen_from) pointerCount--;
+					__unused int c = replace_bss_pointers(tweakLoaderHeader, pointersToReplace, replacementPointers, pointerCount);
+					os_log_dbg("Replaced %u dlopen/dlopen_from pointer(s) in bss section", c);
 
 					// Fall through, since older versions of substitute-loader still called dlopen normally and we don't know what we're dealing with
 				}
@@ -759,21 +1149,25 @@ __attribute__((constructor)) static void initializer(void)
 				if (dlopen_from) {
 					litehook_rebind_symbol((const mach_header *)tweakLoaderHeader, dlopen_from, dlopen_from_hook);
 				}
-				return;
+				skipDynamicInterpose = true;
 #endif
 				// If not arm64e, we can just use dyld_dynamic_interpose, which (unlike litehook) supports armv7 aswell
-				static struct dyld_interpose_tuple interposes[2];
-				interposes[0] = (struct dyld_interpose_tuple){ .replacement = dlopen_hook, .replacee = dlopen };
-				if (dlopen_from) {
-					interposes[1] = (struct dyld_interpose_tuple){ .replacement = dlopen_from_hook, .replacee = dlopen_from };
+				if (!skipDynamicInterpose) {
+					static struct dyld_interpose_tuple interposes[2];
+					interposes[0] = (struct dyld_interpose_tuple){ .replacement = dlopen_hook, .replacee = dlopen };
+					if (dlopen_from) {
+						interposes[1] = (struct dyld_interpose_tuple){ .replacement = dlopen_from_hook, .replacee = dlopen_from };
+					}
+					dyld_dynamic_interpose(tweakLoaderHeader, interposes, dlopen_from ? 2 : 1);
+					os_log_dbg("Initialized %u interpose(s) in tweak loader", dlopen_from ? 2 : 1);
 				}
-				dyld_dynamic_interpose(tweakLoaderHeader, interposes, dlopen_from ? 2 : 1);
-				os_log_dbg("Initialized %u interpose(s) in tweak loader", dlopen_from ? 2 : 1);
 			}
 			else {
 				os_log_dbg("Unable to find tweak loader");
 			}
 		}
 	}
-	install_dyld_hooks();
+	if (should_enable_stealth_hiding()) {
+		install_stealth_hiding_hooks();
+	}
 }

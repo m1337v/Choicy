@@ -298,10 +298,6 @@ void determineLoadingOrder()
 
 	if (choicyIndex == NSNotFound) return;
 
-	if(access(jbroot("/usr/lib/libellekit.dylib"), F_OK)==0) {
-		return; //ellekit's TweakLoader always load Choicy first
-	}
-
 	if (choicyIndex != 0) {
 		dylibsBeforeChoicy = [dylibsInOrder subarrayWithRange:NSMakeRange(0,choicyIndex)];
 	}

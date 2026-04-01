@@ -123,7 +123,7 @@ NSArray *g_packageInfos;
 	if (dpkgInfo) {
 		NSArray *infoLines = [dpkgInfo componentsSeparatedByString:@"\n"];
 		[infoLines enumerateObjectsUsingBlock:^(NSString *infoLine, NSUInteger idx, BOOL *stop) {
-			if ([CHPTweakList isTweakLibraryPath:infoLine]) {
+			if ([CHPTweakList isTweakLibraryPath:jbroot(infoLine)]) {
 				NSString *dylibName = infoLine.lastPathComponent.stringByDeletingPathExtension;
 				[tweakDylibsM addObject:dylibName];
 			}
