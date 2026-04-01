@@ -54,8 +54,10 @@ jobs:
           mkdir -p vendor
           git clone --depth 1 https://github.com/roothide/AltList vendor/AltList
           cd vendor/AltList
-          chmod +x install_to_theos.sh
-          ./install_to_theos.sh
+          make clean
+          make FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide
+          mkdir -p "$THEOS/lib/iphone/roothide/lib"
+          cp -R ./.theos/obj/AltList.framework "$THEOS/lib/iphone/roothide/"
 
       - name: Build Roothide Package
         run: |
