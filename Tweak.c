@@ -29,6 +29,7 @@
 #include <libgen.h>
 #include <os/log.h>
 #include <os/lock.h>
+#include <dispatch/dispatch.h>
 #include <dlfcn.h>
 #include <roothide.h>
 #include <mach-o/dyld.h>
@@ -63,6 +64,7 @@ extern xpc_object_t xpc_create_from_plist(const void *buf, size_t len);
 #define kChoicyProcessPrefsKeyDeniedTweaks "deniedTweaks"
 #define kChoicyProcessPrefsKeyAllowedTweaks "allowedTweaks"
 #define kChoicyProcessPrefsKeyOverwriteGlobalTweakConfiguration "overwriteGlobalTweakConfiguration"
+#define kChoicyProcessPrefsKeyAggressiveHideJBRootImages "aggressiveHideJBRootImages"
 #define kPreferencesBundleID "com.apple.Preferences"
 #define kSpringboardBundleID "com.apple.springboard"
 
@@ -77,6 +79,7 @@ char *gBundleIdentifier = NULL;
 int gProcessType = 0;
 
 bool gTweakInjectionDisabled = false;
+bool gAggressiveHideJBRootImages = false;
 xpc_object_t gAllowedTweaks = NULL;
 xpc_object_t gDeniedTweaks = NULL;
 xpc_object_t gGlobalDeniedTweaks = NULL;
@@ -131,7 +134,10 @@ static uint32_t (*dyld_image_count_orig)(void) = NULL;
 static const char *(*dyld_get_image_name_orig)(uint32_t) = NULL;
 static const struct mach_header *(*dyld_get_image_header_orig)(uint32_t) = NULL;
 static intptr_t (*dyld_get_image_vmaddr_slide_orig)(uint32_t) = NULL;
+static void (*dyld_register_func_for_add_image_orig)(void (*)(const struct mach_header *, intptr_t)) = NULL;
+static void (*dyld_register_func_for_remove_image_orig)(void (*)(const struct mach_header *, intptr_t)) = NULL;
 static char *(*getenv_orig)(const char *) = NULL;
+static void *(*dlsym_orig)(void *, const char *) = NULL;
 static int (*dladdr_orig)(const void *, Dl_info *) = NULL;
 static kern_return_t (*task_info_orig)(task_name_t, task_flavor_t, task_info_t, mach_msg_type_number_t *) = NULL;
 static __thread int gStealthBypassCheckDepth = 0;
@@ -140,7 +146,51 @@ static struct dyld_image_info *gSanitizedImageInfoArray = NULL;
 static uint32_t gSanitizedImageInfoCapacity = 0;
 static struct dyld_uuid_info *gSanitizedUuidInfoArray = NULL;
 static uint32_t gSanitizedUuidInfoCapacity = 0;
+static const struct dyld_all_image_infos *gSanitizedSourceInfos = NULL;
+static const struct dyld_image_info *gSanitizedSourceInfoArray = NULL;
+static uint32_t gSanitizedSourceInfoCount = 0;
+static const struct dyld_uuid_info *gSanitizedSourceUuidArray = NULL;
+static uint32_t gSanitizedSourceUuidCount = 0;
+static uint64_t gSanitizedVisibleImageGeneration = 0;
 static os_unfair_lock gTaskInfoSanitizeLock = OS_UNFAIR_LOCK_INIT;
+
+typedef void (*dyld_image_callback_t)(const struct mach_header *, intptr_t);
+
+typedef struct {
+	const struct mach_header *header;
+	intptr_t slide;
+	const char *path;
+} stealth_visible_image_t;
+
+typedef struct {
+	const char *symbol;
+	void *replacement;
+} stealth_symbol_remap_t;
+
+typedef struct {
+	const void *returnAddress;
+	bool bypass;
+} stealth_caller_cache_entry_t;
+
+static dyld_image_callback_t *gStealthAddImageCallbacks = NULL;
+static uint32_t gStealthAddImageCallbackCount = 0;
+static uint32_t gStealthAddImageCallbackCapacity = 0;
+static dyld_image_callback_t *gStealthRemoveImageCallbacks = NULL;
+static uint32_t gStealthRemoveImageCallbackCount = 0;
+static uint32_t gStealthRemoveImageCallbackCapacity = 0;
+static stealth_visible_image_t *gStealthVisibleImages = NULL;
+static uint32_t gStealthVisibleImageCount = 0;
+static uint32_t gStealthVisibleImageCapacity = 0;
+static uint64_t gStealthVisibleImageGeneration = 1;
+static os_unfair_lock gStealthDyldCallbackLock = OS_UNFAIR_LOCK_INIT;
+static bool gStealthDyldBridgesInstalled = false;
+static stealth_caller_cache_entry_t gStealthCallerCache[64] = {0};
+static uint32_t gStealthCallerCacheNextSlot = 0;
+static os_unfair_lock gStealthCallerCacheLock = OS_UNFAIR_LOCK_INIT;
+static xpc_object_t gDylibDecisionCache = NULL;
+static os_unfair_lock gDylibDecisionCacheLock = OS_UNFAIR_LOCK_INIT;
+
+static kern_return_t task_info_hook(task_name_t targetTask, task_flavor_t flavor, task_info_t taskInfoOut, mach_msg_type_number_t *taskInfoOutCnt);
 
 int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
 int csops_audittoken(pid_t pid, unsigned int ops, void *useraddr, size_t usersize, audit_token_t *token);
@@ -156,25 +206,63 @@ static bool should_enable_stealth_hiding(void)
 	return gTweakInjectionDisabled || gAllowedTweaks;
 }
 
+static bool should_fast_block_all_tweaks(void)
+{
+	if (gTweakInjectionDisabled) {
+		return true;
+	}
+
+	return gAllowedTweaks && xpc_array_get_count(gAllowedTweaks) == 0;
+}
+
+static bool path_is_in_aggressive_hidden_jbroot_directory(const char *path)
+{
+	if (!path || !gAggressiveHideJBRootImages) {
+		return false;
+	}
+
+	if (gExecutablePath && !strcmp(path, gExecutablePath)) {
+		return false;
+	}
+
+	static const char *activeJBRoot = NULL;
+	static size_t activeJBRootLength = 0;
+	static const char *varJBRoot = "/var/jb";
+	static const size_t varJBRootLength = 7;
+	static dispatch_once_t onceToken;
+	dispatch_once(&onceToken, ^{
+		activeJBRoot = jbroot("/");
+		if (activeJBRoot) {
+			activeJBRootLength = strlen(activeJBRoot);
+		}
+	});
+
+	const char *relativePath = NULL;
+
+	if (activeJBRootLength > 0 && string_has_prefix(path, activeJBRoot)) {
+		relativePath = path + activeJBRootLength - 1;
+	}
+	else if (string_has_prefix(path, varJBRoot)) {
+		relativePath = path + varJBRootLength;
+	}
+
+	if (!relativePath || relativePath[0] != '/') {
+		return false;
+	}
+
+	return string_has_prefix(relativePath, "/basebin/")
+		|| string_has_prefix(relativePath, "/usr/lib/")
+		|| string_has_prefix(relativePath, "/Library/Frameworks/")
+		|| string_has_prefix(relativePath, "/Library/MobileSubstrate/DynamicLibraries/");
+}
+
 static bool path_is_in_hidden_tweak_directory(const char *path)
 {
 	if (!path) return false;
 
-	const char *hiddenPrefixes[] = {
-		jbroot("/Library/MobileSubstrate/DynamicLibraries/"),
-		jbroot("/usr/lib/TweakInject/"),
-		"/var/jb/Library/MobileSubstrate/DynamicLibraries/",
-		"/var/jb/usr/lib/TweakInject/",
-	};
-
-	for (uint32_t i = 0; i < sizeof(hiddenPrefixes) / sizeof(*hiddenPrefixes); i++) {
-		const char *prefix = hiddenPrefixes[i];
-		if (prefix && string_has_prefix(path, prefix)) {
-			return true;
-		}
-	}
-
-	return false;
+	return strstr(path, "/TweakInject/")
+		|| strstr(path, "/MobileSubstrate/DynamicLibraries/")
+		|| strstr(path, "/DynamicPatches/");
 }
 
 static bool path_is_hidden_loader(const char *path)
@@ -187,11 +275,17 @@ static bool path_is_hidden_loader(const char *path)
 	const char *hiddenNames[] = {
 		"   Choicy.dylib",
 		"Choicy.dylib",
+		"AutoPatch.dylib",
 		"TweakLoader.dylib",
 		"substitute-loader.dylib",
 		"TweakInject.dylib",
 		"SubstrateLoader.dylib",
+		"libellekit.dylib",
+		"libhooker.dylib",
+		"libsandy.dylib",
 		"libsonar.dylib",
+		"libsubstitute.dylib",
+		"libsubstrate.dylib",
 		"roothideinit.dylib",
 		"roothidepatch.dylib",
 		"libroothide.dylib",
@@ -207,13 +301,117 @@ static bool path_is_hidden_loader(const char *path)
 	return string_has_prefix(basename, "systemhook-") && string_has_suffix(basename, ".dylib");
 }
 
+static bool path_is_in_tweak_injection_directory(const char *path)
+{
+	if (!path) {
+		return false;
+	}
+
+	return strstr(path, "/TweakInject/") || strstr(path, "/MobileSubstrate/DynamicLibraries/");
+}
+
+static bool path_has_neighbor_plist(const char *dylibPath)
+{
+	if (!dylibPath || !string_has_suffix(dylibPath, ".dylib")) {
+		return false;
+	}
+
+	size_t dylibPathLength = strlen(dylibPath) + 1;
+	char plistPath[dylibPathLength];
+	strcpy(plistPath, dylibPath);
+	strlcpy(&plistPath[dylibPathLength - 6], "plist", 6);
+	return access(plistPath, R_OK) == 0;
+}
+
+static bool path_is_probable_tweak(const char *dylibPath)
+{
+	return path_is_in_tweak_injection_directory(dylibPath) && path_has_neighbor_plist(dylibPath);
+}
+
+static bool dylib_decision_cache_get(const char *path, bool *decisionOut)
+{
+	if (!path || !decisionOut) {
+		return false;
+	}
+
+	bool found = false;
+	os_unfair_lock_lock(&gDylibDecisionCacheLock);
+	if (gDylibDecisionCache) {
+		xpc_object_t cachedValue = xpc_dictionary_get_value(gDylibDecisionCache, path);
+		if (cachedValue && xpc_get_type(cachedValue) == XPC_TYPE_BOOL) {
+			*decisionOut = xpc_bool_get_value(cachedValue);
+			found = true;
+		}
+	}
+	os_unfair_lock_unlock(&gDylibDecisionCacheLock);
+	return found;
+}
+
+static void dylib_decision_cache_set(const char *path, bool decision)
+{
+	if (!path) {
+		return;
+	}
+
+	os_unfair_lock_lock(&gDylibDecisionCacheLock);
+	if (!gDylibDecisionCache) {
+		gDylibDecisionCache = xpc_dictionary_create(NULL, NULL, 0);
+	}
+	if (gDylibDecisionCache) {
+		xpc_dictionary_set_bool(gDylibDecisionCache, path, decision);
+	}
+	os_unfair_lock_unlock(&gDylibDecisionCacheLock);
+}
+
+static bool caller_bypass_cache_get(const void *returnAddress, bool *decisionOut)
+{
+	if (!returnAddress || !decisionOut) {
+		return false;
+	}
+
+	bool found = false;
+	os_unfair_lock_lock(&gStealthCallerCacheLock);
+	for (uint32_t i = 0; i < sizeof(gStealthCallerCache) / sizeof(*gStealthCallerCache); i++) {
+		if (gStealthCallerCache[i].returnAddress == returnAddress) {
+			*decisionOut = gStealthCallerCache[i].bypass;
+			found = true;
+			break;
+		}
+	}
+	os_unfair_lock_unlock(&gStealthCallerCacheLock);
+	return found;
+}
+
+static void caller_bypass_cache_set(const void *returnAddress, bool bypass)
+{
+	if (!returnAddress) {
+		return;
+	}
+
+	os_unfair_lock_lock(&gStealthCallerCacheLock);
+	for (uint32_t i = 0; i < sizeof(gStealthCallerCache) / sizeof(*gStealthCallerCache); i++) {
+		if (gStealthCallerCache[i].returnAddress == returnAddress) {
+			gStealthCallerCache[i].bypass = bypass;
+			os_unfair_lock_unlock(&gStealthCallerCacheLock);
+			return;
+		}
+	}
+
+	uint32_t slot = gStealthCallerCacheNextSlot++ % (sizeof(gStealthCallerCache) / sizeof(*gStealthCallerCache));
+	gStealthCallerCache[slot] = (stealth_caller_cache_entry_t){
+		.returnAddress = returnAddress,
+		.bypass = bypass,
+	};
+	os_unfair_lock_unlock(&gStealthCallerCacheLock);
+}
+
 static bool should_hide_from_app(const char *path)
 {
 	if (!should_enable_stealth_hiding()) {
 		return false;
 	}
 
-	return path_is_in_hidden_tweak_directory(path) || path_is_hidden_loader(path);
+	return path_is_in_aggressive_hidden_jbroot_directory(path) || path_is_in_hidden_tweak_directory(path) || path_is_hidden_loader(path);
 }
 
 static bool should_hide_env_name(const char *name)
@@ -252,6 +450,16 @@ static const char *path_for_mach_header_in_infos(const struct dyld_all_image_inf
 		}
 	}
 
+	os_unfair_lock_lock(&gStealthDyldCallbackLock);
+	for (uint32_t i = 0; i < gStealthVisibleImageCount; i++) {
+		if (gStealthVisibleImages[i].header == header) {
+			const char *path = gStealthVisibleImages[i].path;
+			os_unfair_lock_unlock(&gStealthDyldCallbackLock);
+			return path;
+		}
+	}
+	os_unfair_lock_unlock(&gStealthDyldCallbackLock);
+
 	Dl_info info = {0};
 	if (resolve_dladdr(header, &info) == 0) {
 		return NULL;
@@ -279,6 +487,11 @@ static bool caller_should_bypass_hiding(const void *returnAddress)
 		return false;
 	}
 
+	bool cachedBypass = false;
+	if (caller_bypass_cache_get(returnAddress, &cachedBypass)) {
+		return cachedBypass;
+	}
+
 	Dl_info callerInfo = {0};
 	gStealthBypassCheckDepth++;
 	int dladdrResult = resolve_dladdr(returnAddress, &callerInfo);
@@ -287,12 +500,197 @@ static bool caller_should_bypass_hiding(const void *returnAddress)
 		return false;
 	}
 
-	return path_is_hidden_loader(callerInfo.dli_fname) || path_is_in_hidden_tweak_directory(callerInfo.dli_fname);
+	bool shouldBypass = path_is_in_aggressive_hidden_jbroot_directory(callerInfo.dli_fname)
+		|| path_is_hidden_loader(callerInfo.dli_fname)
+		|| path_is_in_hidden_tweak_directory(callerInfo.dli_fname);
+	caller_bypass_cache_set(returnAddress, shouldBypass);
+	return shouldBypass;
+}
+
+static bool ensure_stealth_buffer_capacity(void **buffer, uint32_t *capacity, uint32_t requiredCount, size_t elementSize)
+{
+	if (requiredCount <= *capacity) {
+		return true;
+	}
+
+	uint32_t newCapacity = *capacity ? *capacity : 8;
+	while (newCapacity < requiredCount) {
+		newCapacity *= 2;
+	}
+
+	void *newBuffer = realloc(*buffer, elementSize * newCapacity);
+	if (!newBuffer) {
+		return false;
+	}
+
+	*buffer = newBuffer;
+	*capacity = newCapacity;
+	return true;
+}
+
+static uint32_t stealth_visible_image_count(void)
+{
+	os_unfair_lock_lock(&gStealthDyldCallbackLock);
+	uint32_t count = gStealthVisibleImageCount;
+	os_unfair_lock_unlock(&gStealthDyldCallbackLock);
+	return count;
+}
+
+static uint64_t stealth_visible_image_generation(void)
+{
+	os_unfair_lock_lock(&gStealthDyldCallbackLock);
+	uint64_t generation = gStealthVisibleImageGeneration;
+	os_unfair_lock_unlock(&gStealthDyldCallbackLock);
+	return generation;
+}
+
+static bool stealth_visible_image_get(uint32_t index, stealth_visible_image_t *imageOut)
+{
+	if (!imageOut) {
+		return false;
+	}
+
+	os_unfair_lock_lock(&gStealthDyldCallbackLock);
+	if (index >= gStealthVisibleImageCount) {
+		os_unfair_lock_unlock(&gStealthDyldCallbackLock);
+		return false;
+	}
+
+	*imageOut = gStealthVisibleImages[index];
+	os_unfair_lock_unlock(&gStealthDyldCallbackLock);
+	return true;
+}
+
+static bool stealth_visible_images_add_locked(const struct mach_header *header, intptr_t slide, const char *path)
+{
+	for (uint32_t i = 0; i < gStealthVisibleImageCount; i++) {
+		if (gStealthVisibleImages[i].header == header) {
+			if (gStealthVisibleImages[i].slide != slide || gStealthVisibleImages[i].path != path) {
+				gStealthVisibleImages[i].slide = slide;
+				gStealthVisibleImages[i].path = path;
+				gStealthVisibleImageGeneration++;
+			}
+			return true;
+		}
+	}
+
+	if (!ensure_stealth_buffer_capacity((void **)&gStealthVisibleImages, &gStealthVisibleImageCapacity, gStealthVisibleImageCount + 1, sizeof(*gStealthVisibleImages))) {
+		return false;
+	}
+
+	gStealthVisibleImages[gStealthVisibleImageCount++] = (stealth_visible_image_t){
+		.header = header,
+		.slide = slide,
+		.path = path,
+	};
+	gStealthVisibleImageGeneration++;
+	return true;
+}
+
+static bool stealth_visible_images_remove_locked(const struct mach_header *header)
+{
+	for (uint32_t i = 0; i < gStealthVisibleImageCount; i++) {
+		if (gStealthVisibleImages[i].header == header) {
+			gStealthVisibleImages[i] = gStealthVisibleImages[gStealthVisibleImageCount - 1];
+			gStealthVisibleImageCount--;
+			gStealthVisibleImageGeneration++;
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static dyld_image_callback_t *copy_dyld_callbacks_locked(dyld_image_callback_t *callbacks, uint32_t callbackCount)
+{
+	if (callbackCount == 0 || !callbacks) {
+		return NULL;
+	}
+
+	size_t callbackBytes = sizeof(*callbacks) * callbackCount;
+	dyld_image_callback_t *snapshot = malloc(callbackBytes);
+	if (!snapshot) {
+		return NULL;
+	}
+
+	memcpy(snapshot, callbacks, callbackBytes);
+	return snapshot;
+}
+
+static stealth_visible_image_t *copy_visible_images_locked(uint32_t *imageCountOut)
+{
+	if (imageCountOut) {
+		*imageCountOut = gStealthVisibleImageCount;
+	}
+
+	if (gStealthVisibleImageCount == 0 || !gStealthVisibleImages) {
+		return NULL;
+	}
+
+	size_t imageBytes = sizeof(*gStealthVisibleImages) * gStealthVisibleImageCount;
+	stealth_visible_image_t *snapshot = malloc(imageBytes);
+	if (!snapshot) {
+		if (imageCountOut) {
+			*imageCountOut = 0;
+		}
+		return NULL;
+	}
+
+	memcpy(snapshot, gStealthVisibleImages, imageBytes);
+	return snapshot;
+}
+
+static void dispatch_dyld_callbacks(dyld_image_callback_t *callbacks, uint32_t callbackCount, const struct mach_header *header, intptr_t slide)
+{
+	for (uint32_t i = 0; i < callbackCount; i++) {
+		callbacks[i](header, slide);
+	}
+}
+
+static void stealth_add_image_bridge(const struct mach_header *header, intptr_t slide)
+{
+	const char *path = path_for_mach_header_in_infos(NULL, header);
+	if (should_hide_from_app(path)) {
+		return;
+	}
+
+	dyld_image_callback_t *callbacks = NULL;
+	uint32_t callbackCount = 0;
+
+	os_unfair_lock_lock(&gStealthDyldCallbackLock);
+	stealth_visible_images_add_locked(header, slide, path);
+	callbackCount = gStealthAddImageCallbackCount;
+	callbacks = copy_dyld_callbacks_locked(gStealthAddImageCallbacks, callbackCount);
+	os_unfair_lock_unlock(&gStealthDyldCallbackLock);
+
+	if (callbacks) {
+		dispatch_dyld_callbacks(callbacks, callbackCount, header, slide);
+		free(callbacks);
+	}
+}
+
+static void stealth_remove_image_bridge(const struct mach_header *header, intptr_t slide)
+{
+	dyld_image_callback_t *callbacks = NULL;
+	uint32_t callbackCount = 0;
+
+	os_unfair_lock_lock(&gStealthDyldCallbackLock);
+	bool shouldNotify = stealth_visible_images_remove_locked(header);
+	if (shouldNotify) {
+		callbackCount = gStealthRemoveImageCallbackCount;
+		callbacks = copy_dyld_callbacks_locked(gStealthRemoveImageCallbacks, callbackCount);
+	}
+	os_unfair_lock_unlock(&gStealthDyldCallbackLock);
+
+	if (callbacks) {
+		dispatch_dyld_callbacks(callbacks, callbackCount, header, slide);
+		free(callbacks);
+	}
 }
 
 static uint32_t dyld_image_count_hook(void)
 {
-	if (!dyld_image_count_orig || !dyld_get_image_name_orig) {
+	if (!dyld_image_count_orig) {
 		return 0;
 	}
 
@@ -300,24 +698,12 @@ static uint32_t dyld_image_count_hook(void)
 		return dyld_image_count_orig();
 	}
 
-	uint32_t realCount = dyld_image_count_orig();
-	uint32_t visibleCount = 0;
-
-	for (uint32_t i = 0; i < realCount; i++) {
-		const char *path = dyld_get_image_name_orig(i);
-		if (!path || should_hide_from_app(path)) {
-			continue;
-		}
-
-		visibleCount++;
-	}
-
-	return visibleCount;
+	return stealth_visible_image_count();
 }
 
 static const char *dyld_get_image_name_hook(uint32_t idx)
 {
-	if (!dyld_image_count_orig || !dyld_get_image_name_orig) {
+	if (!dyld_get_image_name_orig) {
 		return NULL;
 	}
 
@@ -325,28 +711,13 @@ static const char *dyld_get_image_name_hook(uint32_t idx)
 		return dyld_get_image_name_orig(idx);
 	}
 
-	uint32_t realCount = dyld_image_count_orig();
-	uint32_t visibleSoFar = 0;
-
-	for (uint32_t i = 0; i < realCount; i++) {
-		const char *path = dyld_get_image_name_orig(i);
-		if (!path || should_hide_from_app(path)) {
-			continue;
-		}
-
-		if (visibleSoFar == idx) {
-			return path;
-		}
-
-		visibleSoFar++;
-	}
-
-	return NULL;
+	stealth_visible_image_t visibleImage = {0};
+	return stealth_visible_image_get(idx, &visibleImage) ? visibleImage.path : NULL;
 }
 
 static const struct mach_header *dyld_get_image_header_hook(uint32_t idx)
 {
-	if (!dyld_image_count_orig || !dyld_get_image_name_orig || !dyld_get_image_header_orig) {
+	if (!dyld_get_image_header_orig) {
 		return NULL;
 	}
 
@@ -354,28 +725,13 @@ static const struct mach_header *dyld_get_image_header_hook(uint32_t idx)
 		return dyld_get_image_header_orig(idx);
 	}
 
-	uint32_t realCount = dyld_image_count_orig();
-	uint32_t visibleSoFar = 0;
-
-	for (uint32_t i = 0; i < realCount; i++) {
-		const char *path = dyld_get_image_name_orig(i);
-		if (!path || should_hide_from_app(path)) {
-			continue;
-		}
-
-		if (visibleSoFar == idx) {
-			return dyld_get_image_header_orig(i);
-		}
-
-		visibleSoFar++;
-	}
-
-	return NULL;
+	stealth_visible_image_t visibleImage = {0};
+	return stealth_visible_image_get(idx, &visibleImage) ? visibleImage.header : NULL;
 }
 
 static intptr_t dyld_get_image_vmaddr_slide_hook(uint32_t idx)
 {
-	if (!dyld_image_count_orig || !dyld_get_image_name_orig || !dyld_get_image_vmaddr_slide_orig) {
+	if (!dyld_get_image_vmaddr_slide_orig) {
 		return 0;
 	}
 
@@ -383,23 +739,79 @@ static intptr_t dyld_get_image_vmaddr_slide_hook(uint32_t idx)
 		return dyld_get_image_vmaddr_slide_orig(idx);
 	}
 
-	uint32_t realCount = dyld_image_count_orig();
-	uint32_t visibleSoFar = 0;
+	stealth_visible_image_t visibleImage = {0};
+	return stealth_visible_image_get(idx, &visibleImage) ? visibleImage.slide : 0;
+}
 
-	for (uint32_t i = 0; i < realCount; i++) {
-		const char *path = dyld_get_image_name_orig(i);
-		if (!path || should_hide_from_app(path)) {
-			continue;
+static void dyld_register_func_for_add_image_hook(void (*func)(const struct mach_header *, intptr_t))
+{
+	if (!func) {
+		if (dyld_register_func_for_add_image_orig) {
+			dyld_register_func_for_add_image_orig(func);
 		}
-
-		if (visibleSoFar == idx) {
-			return dyld_get_image_vmaddr_slide_orig(i);
-		}
-
-		visibleSoFar++;
+		return;
 	}
 
-	return 0;
+	if (caller_should_bypass_hiding(__builtin_extract_return_addr(__builtin_return_address(0)))) {
+		if (dyld_register_func_for_add_image_orig) {
+			dyld_register_func_for_add_image_orig(func);
+		}
+		return;
+	}
+
+	bool stored = false;
+	stealth_visible_image_t *visibleImages = NULL;
+	uint32_t visibleImageCount = 0;
+
+	os_unfair_lock_lock(&gStealthDyldCallbackLock);
+	if (ensure_stealth_buffer_capacity((void **)&gStealthAddImageCallbacks, &gStealthAddImageCallbackCapacity, gStealthAddImageCallbackCount + 1, sizeof(*gStealthAddImageCallbacks))) {
+		gStealthAddImageCallbacks[gStealthAddImageCallbackCount++] = func;
+		stored = true;
+		visibleImages = copy_visible_images_locked(&visibleImageCount);
+	}
+	os_unfair_lock_unlock(&gStealthDyldCallbackLock);
+
+	if (!stored) {
+		if (dyld_register_func_for_add_image_orig) {
+			dyld_register_func_for_add_image_orig(func);
+		}
+		return;
+	}
+
+	for (uint32_t i = 0; i < visibleImageCount; i++) {
+		func(visibleImages[i].header, visibleImages[i].slide);
+	}
+
+	free(visibleImages);
+}
+
+static void dyld_register_func_for_remove_image_hook(void (*func)(const struct mach_header *, intptr_t))
+{
+	if (!func) {
+		if (dyld_register_func_for_remove_image_orig) {
+			dyld_register_func_for_remove_image_orig(func);
+		}
+		return;
+	}
+
+	if (caller_should_bypass_hiding(__builtin_extract_return_addr(__builtin_return_address(0)))) {
+		if (dyld_register_func_for_remove_image_orig) {
+			dyld_register_func_for_remove_image_orig(func);
+		}
+		return;
+	}
+
+	bool stored = false;
+	os_unfair_lock_lock(&gStealthDyldCallbackLock);
+	if (ensure_stealth_buffer_capacity((void **)&gStealthRemoveImageCallbacks, &gStealthRemoveImageCallbackCapacity, gStealthRemoveImageCallbackCount + 1, sizeof(*gStealthRemoveImageCallbacks))) {
+		gStealthRemoveImageCallbacks[gStealthRemoveImageCallbackCount++] = func;
+		stored = true;
+	}
+	os_unfair_lock_unlock(&gStealthDyldCallbackLock);
+
+	if (!stored && dyld_register_func_for_remove_image_orig) {
+		dyld_register_func_for_remove_image_orig(func);
+	}
 }
 
 static char *getenv_hook(const char *name)
@@ -438,6 +850,37 @@ static int dladdr_hook(const void *addr, Dl_info *info)
 	return 1;
 }
 
+static void *dlsym_hook(void *handle, const char *symbol)
+{
+	if (!dlsym_orig || !symbol) {
+		return dlsym_orig ? dlsym_orig(handle, symbol) : NULL;
+	}
+
+	if (caller_should_bypass_hiding(__builtin_extract_return_addr(__builtin_return_address(0)))) {
+		return dlsym_orig(handle, symbol);
+	}
+
+	static const stealth_symbol_remap_t remaps[] = {
+		{ "_dyld_image_count", (void *)dyld_image_count_hook },
+		{ "_dyld_get_image_name", (void *)dyld_get_image_name_hook },
+		{ "_dyld_get_image_header", (void *)dyld_get_image_header_hook },
+		{ "_dyld_get_image_vmaddr_slide", (void *)dyld_get_image_vmaddr_slide_hook },
+		{ "_dyld_register_func_for_add_image", (void *)dyld_register_func_for_add_image_hook },
+		{ "_dyld_register_func_for_remove_image", (void *)dyld_register_func_for_remove_image_hook },
+		{ "getenv", (void *)getenv_hook },
+		{ "dladdr", (void *)dladdr_hook },
+		{ "task_info", (void *)task_info_hook },
+	};
+
+	for (uint32_t i = 0; i < sizeof(remaps) / sizeof(*remaps); i++) {
+		if (!strcmp(symbol, remaps[i].symbol)) {
+			return remaps[i].replacement;
+		}
+	}
+
+	return dlsym_orig(handle, symbol);
+}
+
 static void sanitize_task_dyld_info_in_place(task_info_t taskInfoOut, mach_msg_type_number_t taskInfoOutCnt)
 {
 	if (!taskInfoOut || taskInfoOutCnt < TASK_DYLD_INFO_COUNT) {
@@ -454,6 +897,9 @@ static void sanitize_task_dyld_info_in_place(task_info_t taskInfoOut, mach_msg_t
 		return;
 	}
 
+	uint32_t sourceUuidCount = (realInfos->version >= 8 && realInfos->uuidArray) ? (uint32_t)realInfos->uuidArrayCount : 0;
+	uint64_t visibleImageGeneration = stealth_visible_image_generation();
+
 	os_unfair_lock_lock(&gTaskInfoSanitizeLock);
 
 	if (!gSanitizedAllImageInfos) {
@@ -462,6 +908,18 @@ static void sanitize_task_dyld_info_in_place(task_info_t taskInfoOut, mach_msg_t
 			os_unfair_lock_unlock(&gTaskInfoSanitizeLock);
 			return;
 		}
+	}
+
+	if (gSanitizedVisibleImageGeneration == visibleImageGeneration
+		&& gSanitizedSourceInfos == realInfos
+		&& gSanitizedSourceInfoArray == realInfos->infoArray
+		&& gSanitizedSourceInfoCount == realInfos->infoArrayCount
+		&& gSanitizedSourceUuidArray == realInfos->uuidArray
+		&& gSanitizedSourceUuidCount == sourceUuidCount) {
+		dyldInfo->all_image_info_addr = (mach_vm_address_t)(uintptr_t)gSanitizedAllImageInfos;
+		dyldInfo->all_image_info_size = (mach_vm_size_t)sizeof(*gSanitizedAllImageInfos);
+		os_unfair_lock_unlock(&gTaskInfoSanitizeLock);
+		return;
 	}
 
 	if (realInfos->infoArrayCount > gSanitizedImageInfoCapacity) {
@@ -518,6 +976,12 @@ static void sanitize_task_dyld_info_in_place(task_info_t taskInfoOut, mach_msg_t
 
 	dyldInfo->all_image_info_addr = (mach_vm_address_t)(uintptr_t)gSanitizedAllImageInfos;
 	dyldInfo->all_image_info_size = (mach_vm_size_t)sizeof(*gSanitizedAllImageInfos);
+	gSanitizedSourceInfos = realInfos;
+	gSanitizedSourceInfoArray = realInfos->infoArray;
+	gSanitizedSourceInfoCount = realInfos->infoArrayCount;
+	gSanitizedSourceUuidArray = realInfos->uuidArray;
+	gSanitizedSourceUuidCount = sourceUuidCount;
+	gSanitizedVisibleImageGeneration = visibleImageGeneration;
 
 	os_unfair_lock_unlock(&gTaskInfoSanitizeLock);
 }
@@ -590,7 +1054,10 @@ static void install_stealth_hiding_hooks(void)
 		{ "_dyld_get_image_name", (void *)dyld_get_image_name_hook, (void **)&dyld_get_image_name_orig },
 		{ "_dyld_get_image_header", (void *)dyld_get_image_header_hook, (void **)&dyld_get_image_header_orig },
 		{ "_dyld_get_image_vmaddr_slide", (void *)dyld_get_image_vmaddr_slide_hook, (void **)&dyld_get_image_vmaddr_slide_orig },
+		{ "_dyld_register_func_for_add_image", (void *)dyld_register_func_for_add_image_hook, (void **)&dyld_register_func_for_add_image_orig },
+		{ "_dyld_register_func_for_remove_image", (void *)dyld_register_func_for_remove_image_hook, (void **)&dyld_register_func_for_remove_image_orig },
 		{ "getenv", (void *)getenv_hook, (void **)&getenv_orig },
+		{ "dlsym", (void *)dlsym_hook, (void **)&dlsym_orig },
 		{ "dladdr", (void *)dladdr_hook, (void **)&dladdr_orig },
 		{ "task_info", (void *)task_info_hook, (void **)&task_info_orig },
 	};
@@ -598,6 +1065,16 @@ static void install_stealth_hiding_hooks(void)
 	int r = rebind_symbols(dyldRebindings, sizeof(dyldRebindings) / sizeof(*dyldRebindings));
 	if (r != 0) {
 		os_log_err("Failed to install stealth hiding hooks: %d", r);
+	}
+
+	if (!gStealthDyldBridgesInstalled) {
+		gStealthDyldBridgesInstalled = true;
+		if (dyld_register_func_for_add_image_orig) {
+			dyld_register_func_for_add_image_orig(stealth_add_image_bridge);
+		}
+		if (dyld_register_func_for_remove_image_orig) {
+			dyld_register_func_for_remove_image_orig(stealth_remove_image_bridge);
+		}
 	}
 
 	if (litehook_hook_function((void *)csops, (void *)csops_hook) != KERN_SUCCESS) {
@@ -738,6 +1215,7 @@ void load_process_preferences(xpc_object_t preferencesXdict, xpc_object_t proces
 	}
 
 	bool customTweakConfigurationEnabled = xpc_dictionary_get_bool(processPreferencesXdict, kChoicyProcessPrefsKeyCustomTweakConfigurationEnabled);
+	gAggressiveHideJBRootImages = xpc_dictionary_get_bool(processPreferencesXdict, kChoicyProcessPrefsKeyAggressiveHideJBRootImages);
 	if (customTweakConfigurationEnabled) {
 		int allowDenyMode = 1;
 		xpc_object_t allowDenyModeVal = xpc_dictionary_get_value(processPreferencesXdict, kChoicyProcessPrefsKeyAllowDenyMode);
@@ -882,8 +1360,8 @@ bool dylib_is_tweak(const char *dylibPath)
 	if (!dylibPath) return false;
 
 	__block bool isTweak = false;
-	if (strstr(dylibPath, "/TweakInject/") || strstr(dylibPath, "/MobileSubstrate/DynamicLibraries/")) {
-		char dylibPathLength = strlen(dylibPath)+1;
+	if (path_is_probable_tweak(dylibPath)) {
+		size_t dylibPathLength = strlen(dylibPath) + 1;
 		char plistPath[dylibPathLength];
 		strcpy(plistPath, dylibPath);
 		strlcpy(&plistPath[dylibPathLength - 6], "plist", 6);
@@ -912,11 +1390,20 @@ bool dylib_is_tweak(const char *dylibPath)
 
 bool should_load_dylib(const char *dylibPath)
 {
+	bool cachedDecision = false;
+	if (dylib_decision_cache_get(dylibPath, &cachedDecision)) {
+		return cachedDecision;
+	}
+
 	if(gTweakInjectionDisabled && string_has_suffix(dylibPath, "/usr/lib/ellekit/OldABI.dylib")) {
+		dylib_decision_cache_set(dylibPath, false);
 		return false;
 	}
 
-	if (!string_has_suffix(dylibPath, ".dylib")) return true;
+	if (!string_has_suffix(dylibPath, ".dylib")) {
+		dylib_decision_cache_set(dylibPath, true);
+		return true;
+	}
 
 	char *dylibNameHeap = path_copy_basename(dylibPath);
 	char dylibName[strlen(dylibNameHeap)+1];
@@ -925,9 +1412,57 @@ bool should_load_dylib(const char *dylibPath)
 
 	dylibName[strlen(dylibName)-6] = '\0';
 
-	if (!strcmp(dylibName, "   Choicy")) return true;
+	if (!strcmp(dylibName, "   Choicy")) {
+		dylib_decision_cache_set(dylibPath, true);
+		return true;
+	}
 
 	os_log_dbg("Checking whether %{public}s.dylib should be loaded...", dylibName);
+
+	bool pathLooksLikeTweak = path_is_probable_tweak(dylibPath);
+	if (pathLooksLikeTweak && should_fast_block_all_tweaks()) {
+		if (gProcessType == PROCESS_TYPE_APP) {
+			if (!strcmp(gBundleIdentifier, kPreferencesBundleID)) {
+				if (!strcmp(dylibName, "PreferenceLoader") || !strcmp(dylibName, "preferred")) {
+					os_log_dbg("%{public}s.dylib ✅ (crucial)", dylibName);
+					dylib_decision_cache_set(dylibPath, true);
+					return true;
+				}
+			}
+			else if (!strcmp(gBundleIdentifier, kSpringboardBundleID)) {
+				if (!strcmp(dylibName, "ChoicySB")) {
+					os_log_dbg("%{public}s.dylib ✅ (crucial)", dylibName);
+					dylib_decision_cache_set(dylibPath, true);
+					return true;
+				}
+			}
+		}
+
+		os_log_dbg("%{public}s.dylib ❌ (fast-blocked tweak in deny-all mode)", dylibName);
+		dylib_decision_cache_set(dylibPath, false);
+		return false;
+	}
+
+	if (pathLooksLikeTweak && gAllowedTweaks) {
+		bool tweakIsAllowed = xpc_array_contains_string(gAllowedTweaks, dylibName);
+		bool tweakIsGloballyDenied = xpc_array_contains_string(gGlobalDeniedTweaks, dylibName);
+
+		if (tweakIsGloballyDenied) {
+			os_log_dbg("%{public}s.dylib ❌ (disabled in global tweak configuration)", dylibName);
+			dylib_decision_cache_set(dylibPath, false);
+			return false;
+		}
+
+		if (!tweakIsAllowed) {
+			os_log_dbg("%{public}s.dylib ❌ (fast-blocked tweak in allow mode)", dylibName);
+			dylib_decision_cache_set(dylibPath, false);
+			return false;
+		}
+
+		os_log_dbg("%{public}s.dylib ✅ (fast-allowed tweak in allow mode)", dylibName);
+		dylib_decision_cache_set(dylibPath, true);
+		return true;
+	}
 
 	if (dylib_is_tweak(dylibPath)) {
 		// dylibs crucial for Choicy itself to work
@@ -935,12 +1470,14 @@ bool should_load_dylib(const char *dylibPath)
 			if (!strcmp(gBundleIdentifier, kPreferencesBundleID)) {
 				if (!strcmp(dylibName, "PreferenceLoader") || !strcmp(dylibName, "preferred")) {
 					os_log_dbg("%{public}s.dylib ✅ (crucial)", dylibName);
+					dylib_decision_cache_set(dylibPath, true);
 					return true;
 				}
 			}
 			else if (!strcmp(gBundleIdentifier, kSpringboardBundleID)) {
 				if (!strcmp(dylibName, "ChoicySB")) {
 					os_log_dbg("%{public}s.dylib ✅ (crucial)", dylibName);
+					dylib_decision_cache_set(dylibPath, true);
 					return true;
 				}
 			}
@@ -948,6 +1485,7 @@ bool should_load_dylib(const char *dylibPath)
 
 		if (gTweakInjectionDisabled) {
 			os_log_dbg("%{public}s.dylib ❌ (tweak injection disabled)", dylibName);
+			dylib_decision_cache_set(dylibPath, false);
 			return false;
 		}
 
@@ -957,25 +1495,30 @@ bool should_load_dylib(const char *dylibPath)
 
 		if (tweakIsGloballyDenied) {
 			os_log_dbg("%{public}s.dylib ❌ (disabled in global tweak configuration)", dylibName);
+			dylib_decision_cache_set(dylibPath, false);
 			return false;
 		}
 
 		if (gAllowedTweaks && !tweakIsAllowed) {
 			os_log_dbg("%{public}s.dylib ❌ (custom tweak configuration on allow and tweak not allowed)", dylibName);
+			dylib_decision_cache_set(dylibPath, false);
 			return false;
 		}
 
 		if (gDeniedTweaks && tweakIsDenied) {
 			os_log_dbg("%{public}s.dylib ❌ (custom tweak configuration on deny and tweak denied)", dylibName);
+			dylib_decision_cache_set(dylibPath, false);
 			return false;
 		}
 	}
 	else {
 		os_log_dbg("%{public}s.dylib ✅ (not a tweak)", dylibName);
+		dylib_decision_cache_set(dylibPath, true);
 		return true;
 	}
 
 	os_log_dbg("%{public}s.dylib ✅ (allowed)", dylibName);
+	dylib_decision_cache_set(dylibPath, true);
 	return true;
 }
 

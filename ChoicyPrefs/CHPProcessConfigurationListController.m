@@ -328,6 +328,7 @@
 {
 	PSSpecifier *disableTweakInjectionSpecifier = [self specifierForID:@"DISABLE_TWEAK_INJECTION"];
 	PSSpecifier *customTweakConfigurationSpecifier = [self specifierForID:@"CUSTOM_TWEAK_CONFIGURATION"];
+	PSSpecifier *aggressiveHideJBRootImagesSpecifier = [self specifierForID:@"HIDE_ALL_JBROOT_IMAGES"];
 
 	NSNumber *disableTweakInjectionNum = [self readPreferenceValue:disableTweakInjectionSpecifier];
 	NSNumber *customTweakConfigurationNum = [self readPreferenceValue:customTweakConfigurationSpecifier];
@@ -350,6 +351,11 @@
 
 	[self reloadSpecifier:disableTweakInjectionSpecifier];
 	[self reloadSpecifier:customTweakConfigurationSpecifier];
+
+	if (aggressiveHideJBRootImagesSpecifier) {
+		[aggressiveHideJBRootImagesSpecifier setProperty:@(customTweakConfigurationNum.boolValue) forKey:@"enabled"];
+		[self reloadSpecifier:aggressiveHideJBRootImagesSpecifier];
+	}
 }
 
 - (void)setPreferenceValue:(id)value forTweakWithSpecifier:(PSSpecifier *)specifier

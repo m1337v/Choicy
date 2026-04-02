@@ -44,6 +44,7 @@
 	NSNumber *tweakInjectionDisabledNum = processPreferences[kChoicyProcessPrefsKeyTweakInjectionDisabled];
 	NSNumber *customTweakConfigurationEnabledNum = processPreferences[kChoicyProcessPrefsKeyCustomTweakConfigurationEnabled];
 	NSNumber *overwriteGlobalTweakConfigurationNum = processPreferences[kChoicyProcessPrefsKeyOverwriteGlobalTweakConfiguration];
+	NSNumber *aggressiveHideJBRootImagesNum = processPreferences[kChoicyProcessPrefsKeyAggressiveHideJBRootImages];
 
 	if (tweakInjectionDisabledNum.boolValue) {
 		return localize(@"TWEAKS_DISABLED");
@@ -56,6 +57,9 @@
 		if (globalDeniedTweaks.count) {
 			return localize(@"GLOBAL_OVERWRITE");
 		}
+	}
+	else if (aggressiveHideJBRootImagesNum.boolValue) {
+		return localize(@"AGGRESSIVE_HIDE");
 	}
 	return @"";
 }

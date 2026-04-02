@@ -22,7 +22,10 @@
 #import "../Shared.h"
 #import "CHPDaemonList.h"
 #import "CHPTweakList.h"
+#import "CHPProcessConfigurationListController.h"
+#import "CoreServices.h"
 #import <mach-o/dyld.h>
+#import <Preferences/PSSpecifier.h>
 #import "CHPPreferences.h"
 #import "../ChoicyPrefsMigrator.h"
 #import <roothide.h>
@@ -258,6 +261,97 @@ void presentNotLoadingFirstWarning(PSListController *plc, BOOL showDontShowAgain
 	if (dylibsBeforeChoicy) {
 		presentNotLoadingFirstWarning(self, YES);
 	}
+}
+
+- (void)viewWillAppear:(BOOL)animated
+{
+	[super viewWillAppear:animated];
+
+	if (_specifiers) {
+		_specifiers = nil;
+		[super reloadSpecifiers];
+	}
+}
+
+- (NSArray *)configuredApplicationSpecifiers
+{
+	NSDictionary *appSettings = preferences[kChoicyPrefsKeyAppSettings];
+	if (![appSettings isKindOfClass:[NSDictionary class]] || appSettings.count == 0) {
+		return @[];
+	}
+
+	NSMutableArray *configuredAppSpecifiers = [NSMutableArray new];
+	[appSettings enumerateKeysAndObjectsUsingBlock:^(NSString *applicationID, NSDictionary *processPreferences, BOOL *stop) {
+		if (![applicationID isKindOfClass:[NSString class]] || [applicationID isEqualToString:kSpringboardBundleID]) {
+			return;
+		}
+
+		if (!processPreferencesHasCustomRule(processPreferences)) {
+			return;
+		}
+
+		LSApplicationProxy *appProxy = [LSApplicationProxy applicationProxyForIdentifier:applicationID];
+		if (!appProxy) {
+			return;
+		}
+
+		NSString *displayName = appProxy.localizedName ?: applicationID;
+		PSSpecifier *appSpecifier = [PSSpecifier preferenceSpecifierNamed:displayName
+							target:[CHPListController class]
+							set:nil
+							get:@selector(previewStringForSpecifier:)
+							detail:[CHPProcessConfigurationListController class]
+							cell:PSLinkListCell
+							edit:nil];
+
+		[appSpecifier setProperty:applicationID forKey:@"applicationIdentifier"];
+		[appSpecifier setProperty:@YES forKey:@"enabled"];
+		[configuredAppSpecifiers addObject:appSpecifier];
+	}];
+
+	[configuredAppSpecifiers sortUsingComparator:^NSComparisonResult(PSSpecifier *left, PSSpecifier *right) {
+		return [left.name localizedCaseInsensitiveCompare:right.name];
+	}];
+
+	if (configuredAppSpecifiers.count == 0) {
+		return @[];
+	}
+
+	PSSpecifier *groupSpecifier = [PSSpecifier preferenceSpecifierNamed:localize(@"CONFIGURED_APPS")
+							target:nil
+							set:nil
+							get:nil
+							detail:nil
+							cell:PSGroupCell
+							edit:nil];
+	[groupSpecifier setProperty:localize(@"CONFIGURED_APPS_FOOTER") forKey:@"footerText"];
+
+	NSMutableArray *specifiers = [NSMutableArray arrayWithObject:groupSpecifier];
+	[specifiers addObjectsFromArray:configuredAppSpecifiers];
+	return specifiers.copy;
+}
+
+- (NSMutableArray *)specifiers
+{
+	if (!_specifiers) {
+		_specifiers = [super specifiers];
+
+		NSArray *configuredSpecifiers = [self configuredApplicationSpecifiers];
+		if (configuredSpecifiers.count > 0) {
+			NSUInteger insertionIndex = [_specifiers indexOfObjectPassingTest:^BOOL(PSSpecifier *specifier, NSUInteger idx, BOOL *stop) {
+				return [specifier.properties[@"label"] isEqualToString:@"PROCESS_CONFIGURATION"];
+			}];
+
+			if (insertionIndex == NSNotFound) {
+				insertionIndex = _specifiers.count;
+			}
+
+			NSIndexSet *indexSet = [NSIndexSet indexSetWithIndexesInRange:NSMakeRange(insertionIndex, configuredSpecifiers.count)];
+			[_specifiers insertObjects:configuredSpecifiers atIndexes:indexSet];
+		}
+	}
+
+	return _specifiers;
 }
 
 @end

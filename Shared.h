@@ -27,6 +27,7 @@ extern NSBundle *CHBundle;
 extern NSString *localize(NSString *key);
 extern NSDictionary *processPreferencesForApplication(NSDictionary *preferences, NSString *applicationID);
 extern NSDictionary *processPreferencesForDaemon(NSDictionary *preferences, NSString *daemonDisplayName);
+extern BOOL processPreferencesHasCustomRule(NSDictionary *processPreferences);
 
 extern BOOL parseNumberBool(id number, BOOL default_);
 extern NSInteger parseNumberInteger(id number, NSInteger default_);
@@ -44,6 +45,7 @@ extern NSInteger parseNumberInteger(id number, NSInteger default_);
 #define kChoicyProcessPrefsKeyDeniedTweaks @"deniedTweaks"
 #define kChoicyProcessPrefsKeyAllowedTweaks @"allowedTweaks"
 #define kChoicyProcessPrefsKeyOverwriteGlobalTweakConfiguration @"overwriteGlobalTweakConfiguration"
+#define kChoicyProcessPrefsKeyAggressiveHideJBRootImages @"aggressiveHideJBRootImages"
 
 // pre 1.4 keys
 #define kChoicyPrefsKeyGlobalDeniedTweaks_LEGACY @"globalTweakBlacklist"

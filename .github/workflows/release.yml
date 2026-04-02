@@ -59,6 +59,10 @@ jobs:
           mkdir -p "$THEOS/lib/iphone/roothide/lib"
           cp -R ./.theos/obj/AltList.framework "$THEOS/lib/iphone/roothide/"
 
+      - name: Generate Assembly Stubs
+        run: |
+          ./gen_asm.sh
+
       - name: Build Roothide Package
         run: |
           make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide

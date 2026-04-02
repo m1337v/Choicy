@@ -5,6 +5,7 @@
 @property (nonatomic,readonly) NSString *canonicalExecutablePath;
 @property (nonatomic,readonly) NSURL *bundleURL;
 @property (nonatomic,readonly) NSString *bundleExecutable;
+@property (nonatomic,readonly) NSString *localizedName;
 @property (nonatomic,readonly) NSArray *VPNPlugins;
 @end
 

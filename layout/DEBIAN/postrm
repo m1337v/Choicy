@@ -1,4 +1,6 @@
 #!/bin/sh
 
+rm -rf /var/jb/Applications/ChoicyApp.app /Applications/ChoicyApp.app 2> /dev/null
+uicache -a 2> /dev/null
 killall runningboardd 2> /dev/null
 exit 0

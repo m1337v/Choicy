@@ -85,3 +85,15 @@ NSDictionary *processPreferencesForDaemon(NSDictionary *preferences, NSString *d
 	NSDictionary *daemonSettings = [preferences objectForKey:kChoicyPrefsKeyDaemonSettings];
 	return [daemonSettings objectForKey:daemonDisplayName];
 }
+
+BOOL processPreferencesHasCustomRule(NSDictionary *processPreferences)
+{
+	if (![processPreferences isKindOfClass:[NSDictionary class]]) {
+		return NO;
+	}
+
+	return parseNumberBool(processPreferences[kChoicyProcessPrefsKeyTweakInjectionDisabled], NO)
+		|| parseNumberBool(processPreferences[kChoicyProcessPrefsKeyCustomTweakConfigurationEnabled], NO)
+		|| parseNumberBool(processPreferences[kChoicyProcessPrefsKeyOverwriteGlobalTweakConfiguration], NO)
+		|| parseNumberBool(processPreferences[kChoicyProcessPrefsKeyAggressiveHideJBRootImages], NO);
+}
