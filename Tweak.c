@@ -262,7 +262,8 @@ static bool path_is_in_hidden_tweak_directory(const char *path)
 
 	return strstr(path, "/TweakInject/")
 		|| strstr(path, "/MobileSubstrate/DynamicLibraries/")
-		|| strstr(path, "/DynamicPatches/");
+		|| strstr(path, "/DynamicPatches/")
+		|| strstr(path, "/Library/Modulous/HookKit/");
 }
 
 static bool path_is_hidden_loader(const char *path)
@@ -277,6 +278,7 @@ static bool path_is_hidden_loader(const char *path)
 		"Choicy.dylib",
 		"AutoPatch.dylib",
 		"TweakLoader.dylib",
+		"shdw.dylib",
 		"substitute-loader.dylib",
 		"TweakInject.dylib",
 		"SubstrateLoader.dylib",
@@ -299,6 +301,31 @@ static bool path_is_hidden_loader(const char *path)
 	}
 
 	return string_has_prefix(basename, "systemhook-") && string_has_suffix(basename, ".dylib");
+}
+
+static bool path_is_hidden_shdw_runtime_binary(const char *path)
+{
+	if (!path) {
+		return false;
+	}
+
+	const char *hiddenSuffixes[] = {
+		"/Library/Frameworks/shdw.framework/shdw",
+		"/Library/Frameworks/HookKit.framework/HookKit",
+		"/Library/Frameworks/Modulous.framework/Modulous",
+		"/Library/Frameworks/RootBridge.framework/RootBridge",
+		"/Library/Modulous/HookKit/HookKitFishhookModule.bundle/HookKitFishhookModule",
+		"/Library/Modulous/HookKit/HookKitElleKitModule.bundle/HookKitElleKitModule",
+		"/Library/Modulous/HookKit/HookKitDobbyModule.bundle/HookKitDobbyModule",
+	};
+
+	for (uint32_t i = 0; i < sizeof(hiddenSuffixes) / sizeof(*hiddenSuffixes); i++) {
+		if (string_has_suffix(path, hiddenSuffixes[i])) {
+			return true;
+		}
+	}
+
+	return false;
 }
 
 static bool path_is_in_tweak_injection_directory(const char *path)
@@ -411,7 +438,10 @@ static bool should_hide_from_app(const char *path)
 		return false;
 	}
 
-	return path_is_in_aggressive_hidden_jbroot_directory(path) || path_is_in_hidden_tweak_directory(path) || path_is_hidden_loader(path);
+	return path_is_in_aggressive_hidden_jbroot_directory(path)
+		|| path_is_in_hidden_tweak_directory(path)
+		|| path_is_hidden_loader(path)
+		|| path_is_hidden_shdw_runtime_binary(path);
 }
 
 static bool should_hide_env_name(const char *name)
